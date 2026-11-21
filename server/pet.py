@@ -1519,14 +1519,17 @@ class Pet:
                                                                    laserColor=ITEMS['laser_colors']['ammunition'].get(ammo, 0),
                                                                    isDiminishedBySkillShield=False, skilledLaser=False, visualType=0))])
         if random.random() < SET.chance('player_hit_chance', COMBAT['laser_hit_chance'] * (1 + self.proto('hit'))):
-            base = self.laser_damage(n, pvp=bool(asset))
-            base *= 1 + self.row()['damage'] + self.proto('laser') + (self.proto('alien') if n else 0)
+            bot = w.pvp_bot(n)                          # a bot's ship counts as a player (world.pvp_bot): PvP laser values, no alien protocol
+            pvp = bool(asset) or bot
+            base = self.laser_damage(n, pvp=pvp)
+            base *= 1 + self.row()['damage'] + self.proto('laser') + (self.proto('alien') if n and not bot else 0)
             if self.d.get('gear') == HP_LINK:
                 base *= self.gear(HP_LINK).get('pet_damage', 1)
             a = ITEMS['laser_ammo'].get(ammo, {'multiplier': 1})
             r = random.uniform(*ITEMS['damage_random'])
             shield = int(base * a.get('shield_multiplier', 0) * r)
-            dmg = shield or int(base * a.get('multiplier', 1) * r) + LASERS.flat_extra(self.lasers(), bool(asset))     # Paritydrill +5: after the multipliers
+            mult = a.get('pvp_multiplier', a.get('multiplier', 1)) if bot else a.get('multiplier', 1)
+            dmg = shield or int(base * mult * r) + LASERS.flat_extra(self.lasers(), pvp)     # Paritydrill +5: after the multipliers
             if asset:
                 w.hit_asset(uid, dmg, 1, shield_only=bool(shield), attacker=self.pid)
                 if not w.asset_at(uid):

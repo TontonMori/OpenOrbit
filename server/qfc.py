@@ -29,7 +29,7 @@ PREFIX = 'equipment_core_'
 MAX_LV = D['max_level']
 FORGE, RECYCLE = 1, 2
 REQUESTS = {'QuantumFluidCoreRequest'}
-KEYS = dict(ATTR_KEYS, damage_factions=('pvp',))          # factions: players of the other company (with bots, stage 11)
+KEYS = dict(ATTR_KEYS, damage_factions=('factions_damage',))     # factions: players and bots of the other company (world.laser_damage, target_bonus)
 
 
 def mod(_cls, **f):

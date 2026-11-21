@@ -91,7 +91,7 @@ def catalog():
 # ------------------------------------------------------------------ item info (the panel's hint)
 # the server's bonus key -> the client's attribute name (metinler_<lang>.json "n": the panel writes in that language)
 ATTRIBUTE_NAME = {'laser': 'dmg_laser', 'rocket': 'dmg_rockets', 'hp': 'hitpoints', 'shield': 'shield', 'speed': 'speed', 'ep': 'experience',
-               'honor': 'honour', 'evasion': 'evasion', 'npc': 'dmg_npc', 'pvp': 'dmg_pvp', 'laser_hit_chance': 'hitchance_laser',
+               'honor': 'honour', 'evasion': 'evasion', 'npc': 'dmg_npc', 'pvp_damage': 'dmg_pvp', 'factions_damage': 'damage_factions', 'laser_hit_chance': 'hitchance_laser',
                'rocket_hit_chance': 'hitchance_rocket', 'shield_penetration': 'shield_penetration'}
 BOOSTER_NAME = {'DAMAGE': 'damage', 'HITPOINTS': 'hitpoints', 'SHIELD': 'shield', 'EXPERIENCE_POINTS': 'experience', 'HONOUR_POINTS': 'honour'}
 

@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 M = json.load(open(os.path.join(HERE, 'data', 'ship_modules.json'), encoding='utf8'))['modules']
 ITEMS = json.load(open(os.path.join(HERE, 'data', 'client_items.json'), encoding='utf8'))['items']
 SHARD, CHIP = 'resource_collectable_unstable-shard', 'resource_collectable_optigrad-chip'
-ATTR_KEYS = {'damage': ('laser', 'rocket'), 'dmg_laser': ('laser',), 'dmg_rockets': ('rocket',), 'dmg_npc': ('npc',), 'dmg_pvp': ('pvp',),
+ATTR_KEYS = {'damage': ('laser', 'rocket'), 'dmg_laser': ('laser',), 'dmg_rockets': ('rocket',), 'dmg_npc': ('npc',), 'dmg_pvp': ('pvp_damage',),
              'hitpoints': ('hp',), 'shield': ('shield',), 'speed': ('speed',), 'evasion': ('evasion',), 'hitchance_laser': ('laser_hit_chance',),
              'hitchance_rocket': ('rocket_hit_chance',), 'experience': ('ep',), 'honour': ('honor',), 'shield_penetration': ('shield_penetration',)}
 POOL = {'DAMAGE': ['damage', 'dmg_laser', 'dmg_rockets', 'dmg_npc'], 'HP': ['hitpoints'], 'SHIELD': ['shield'],

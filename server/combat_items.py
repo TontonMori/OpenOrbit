@@ -1188,7 +1188,7 @@ class Items:
         mods = p.mods()
         dmg = sum(cfg.get('damage', 0) * random.uniform(0.85, 1.0) for _ in range(cnt))
         fusion = SKL.mods(p).get('rocket', 0)                  # Rocket Fusion does not boost Hellstorm (fandom Rocket launcher)
-        dmg = int(dmg * (1 + mods.get('rocket', 0) - fusion + (mods.get('npc', 0) if n else 0) + mods.get('launcher_damage', 0))     # Rapid Fire Plus +%20
+        dmg = int(dmg * (1 + mods.get('rocket', 0) - fusion + w.target_bonus(n, mods) + mods.get('launcher_damage', 0))     # Rapid Fire Plus +%20; alien or PvP bonus
                   * (1 + p.lab_bonus(1)) * launcher_upgrade(p))
         drain = cfg.get('shield_drain', 0) * cnt
         impact = w.hit_asset if asset else w.hit_npc
@@ -1246,10 +1246,13 @@ class Items:
             return
         impact = w.hit_asset if asset else w.hit_npc
         r = ROCKETS[rocket]
-        dmg = r.get('damage', 0) * ((LASERS.name_match(r.get('target_multiplier', {}), n) or 1) if n else 1)      # AGT-500: Agatus'a x5
+        if w.pvp_bot(n):                                    # a bot counted as a player: the rocket's PvP damage (SP-100X 10,800), no alien multiplier
+            dmg = r.get('pvp_damage', r.get('damage', 0)) if r.get('damage') else 0
+        else:
+            dmg = r.get('damage', 0) * ((LASERS.name_match(r.get('target_multiplier', {}), n) or 1) if n else 1)      # AGT-500: Agatus'a x5
         if dmg:
             mods = p.mods()
-            impact(uid, int(dmg * random.uniform(0.85, 1.0) * (1 + mods.get('rocket', 0) + (mods.get('npc', 0) if n else 0))), 0,
+            impact(uid, int(dmg * random.uniform(0.85, 1.0) * (1 + mods.get('rocket', 0) + w.target_bonus(n, mods))), 0,
                       hull_only=bool(r.get('hull_only')))                                  # SP-100X: bypasses the shield
         if r.get('shield_damage'):                                                             # SR-5: steal from the shield
             w.last_shield_hit = 0

@@ -191,8 +191,10 @@ def rocket(w, other, now):
         ('MenuItemCooldownGroupTimerCommand', dict(timerState=D.mod('TimerStateModule', timerStateValue=2),
             cooldownType=D.mod('CooldownTypeModule', typeValue=4), maxTime=ms, time=ms))])
     r = D.ITEMS['rockets'][rocket]
+    enemy = getattr(getattr(other, 'p', None), 'd', {}).get('pilot', {}).get('factionId') != w.p.d['pilot'].get('factionId')
     damage = int(r.get('pvp_damage', r.get('damage', 1000)) * random.uniform(0.85, 1.0)         # BDR-1211 at most 4,000 to players
-                 * (1 + mods.get('rocket', 0) + (mods.get('enemy_rocket', 0) if getattr(getattr(other, 'p', None), 'd', {}).get('pilot', {}).get('factionId') != w.p.d['pilot'].get('factionId') else 0))
+                 * (1 + mods.get('rocket', 0) + (mods.get('enemy_rocket', 0) if enemy else 0)
+                    + mods.get('pvp_damage', 0) + (mods.get('factions_damage', 0) if enemy else 0))     # PvP damage (ship, P.E.T. HEAT, modules, QFC), as on the laser
                  * (1 + w.p.lab_bonus(1)))
     if w.p.lab_bonus(1):
         w.lab_spend(1)

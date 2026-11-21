@@ -2063,8 +2063,10 @@ class World:
             self.send(self.ammo_msgs(rocket) + [self.rocket_msg(uid, hit, ITEMS['rockets'].get(rocket, {}).get('uid', 1)),
                        ('MenuItemCooldownGroupTimerCommand', dict(timerState=mod('TimerStateModule', timerStateValue=2),
                                                                   cooldownType=mod('CooldownTypeModule', typeValue=4), maxTime=ms, time=ms))])
-            dmg = int(ITEMS['rockets'].get(rocket, {'damage': 1000})['damage'] * random.uniform(0.85, 1.0)   # recording: R-310 853/991
-                      * (1 + self.p.mods().get('rocket', 0) + self.p.mods().get('enemy_rocket', 0) + (self.p.mods().get('npc', 0) if n else 0))
+            r = ITEMS['rockets'].get(rocket, {'damage': 1000})
+            base = r.get('pvp_damage', r['damage']) if self.pvp_bot(n) else r['damage']      # BDR-1211 at most 4,000 to a bot, as to a player
+            dmg = int(base * random.uniform(0.85, 1.0)                                         # recording: R-310 853/991
+                      * (1 + self.p.mods().get('rocket', 0) + self.p.mods().get('enemy_rocket', 0) + self.target_bonus(n))
                       * (1 + self.p.lab_bonus(1)))
             if self.p.lab_bonus(1):
                 self.lab_spend(1)                   # rocket upgrade: 1 per rocket
@@ -2920,6 +2922,27 @@ class World:
             msgs.insert(0, ('MenuItemStatusCommand', st))
         return msgs
 
+    @staticmethod
+    def pvp_bot(n):
+        """A bot's ship counts as a player (panel: bot_pvp): the hit takes the PvP values (the lasers' and rockets' PvP damage, PvP ammo
+        multipliers, PvP sets and bonuses) instead of the alien ones. An alien, an asset or None -> False. Before, every hit on a bot used
+        the alien path (laser_damage(ammo, n)): the alien bonuses applied to bots and the PvP ones never did."""
+        return n is not None and getattr(n, 'bot', None) is not None and bool(SET.get('bot_pvp'))
+
+    def enemy_bot(self, n):
+        """The bot is from another company: the "against factions" bonus; Leonov's home advantage is not used against a friend."""
+        return getattr(getattr(n, 'bot', None), 'company', None) != self.p.d['pilot'].get('factionId')
+
+    def target_bonus(self, n, mods=None):
+        """The target's share of the damage bonus (rockets, launcher, special rockets): 'npc' against an alien; against a bot counted as a
+        player 'pvp_damage' (+ 'factions_damage' if it is from another company); nothing against an asset (n is None)."""
+        if n is None:
+            return 0
+        mods = mods if mods is not None else self.p.mods()
+        if self.pvp_bot(n):
+            return mods.get('pvp_damage', 0) + (mods.get('factions_damage', 0) if self.enemy_bot(n) else 0)
+        return mods.get('npc', 0)
+
     def laser_damage(self, ammo, target=None, now=None, pvp=False, ev=True):
         """Total laser damage = total laser damage x ammo multiplier x random (recording: 65 x 0.76-1.0).
         The lasers' special properties are in lasers.py (Unstable LF-4 random, Prometheus x3.5, set bonuses, Odysseus crit, SL-01 extra damage).
@@ -2949,7 +2972,8 @@ class World:
             base += (hits * (1 + DRONE_LEVELS[level - 1]['laser'] + mods.get('drone_laser', 0))      # Havoc, Cerberus: to the drone laser
                      * UPG.factor(dloot, dup, UPG.DRONE_DAMAGE))
         base *= ((1 + mods.get('laser', 0) + (mods.get('home_laser', 0) if ev else 0)                 # Leonov home advantage (not against a friend)
-                  + ((mods.get('pvp_laser', 0) + mods.get('pvp_damage', 0)) if pvp else (mods.get('npc', 0) + mods.get('npc_laser', 0))))       # formation, drone design
+                  + ((mods.get('pvp_laser', 0) + mods.get('pvp_damage', 0) + (mods.get('factions_damage', 0) if ev else 0))     # formation, drone design,
+                     if pvp else (mods.get('npc', 0) + mods.get('npc_laser', 0))))                                                # modules, QFC
                  * (1 + self.p.lab_bonus(0)))                                                   # laser upgrade
         a = ITEMS['laser_ammo'].get(ammo, {'multiplier': 1})
         r = random.uniform(*ITEMS['damage_random'])
@@ -3254,7 +3278,8 @@ class World:
         self.p.ach('laser_types', items=recent)
         m_ = self.p.mods()
         if random.random() < self.items.aim(SET.chance('player_hit_chance', COMBAT['laser_hit_chance'] * (1 + m_.get('hit', 0) + m_.get('laser_hit_chance', 0)))):   # + AIM CPU, P.E.T. HEAT; panel
-            dmg, shield_dmg = self.laser_damage(ammo, n)
+            bot = self.pvp_bot(n)                     # a bot's ship: PvP values (pvp_bot)
+            dmg, shield_dmg = self.laser_damage(ammo, n, pvp=bot, ev=not bot or self.enemy_bot(n))
             if shield_dmg:
                 self.last_shield_hit = 0
                 self.hit_npc(n.id, shield_dmg, 1, shield_only=True, ammo=ammo)

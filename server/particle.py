@@ -190,9 +190,19 @@ def cannon_for(p, element):
     return next((i for i in equipped(p, 'cannon') if CANNONS.get(p.d['items'][str(i)], {}).get('element') == element), None)
 
 
-def shield_npc(p, e):
-    """Damage bonus (points) of the equipped breakers against aliens of element e."""
-    return sum(attrs(p, i).get('cannon_damage_npc_' + e, 0) for i in equipped(p, 'cannonShield'))
+def shield_npc(p, e, kind='npc'):
+    """Damage bonus (points) of the equipped breakers for the cannon of element e: kind 'npc' against aliens, 'pvp' against a bot counted
+    as a player (world.pvp_bot)."""
+    return sum(attrs(p, i).get('cannon_damage_%s_%s' % (kind, e), 0) for i in equipped(p, 'cannonShield'))
+
+
+def cannon_bonus(p, a, e, pvp=False, enemy=True):
+    """A cannon shot's damage bonus (points): its own damage attribute + against aliens (npc) or, against a bot counted as a player, PvP
+    and "against factions" (another company) + the breakers' share."""
+    if pvp:
+        return (a.get(DMG_KEY[e], 0) + a.get('cannon_damage_pvp_' + e, 0) + (a.get('cannon_damage_factions_' + e, 0) if enemy else 0)
+                + shield_npc(p, e, 'pvp'))
+    return a.get(DMG_KEY[e], 0) + a.get('cannon_damage_npc_' + e, 0) + shield_npc(p, e)
 
 
 def mods(p, ship_loot, cfg):
@@ -353,9 +363,11 @@ def lock_reroll(p, iid, locks, rng=random):
 
 
 # ---------------------------------------------------------------- flight
-def drive_power(p, ids):
+def drive_power(p, ids, kind='npc'):
     """Total damage of the equipped drives (level, sub-attribute, set multiplier), field radius (Apex and Prime set) and the best drive's
-    visual tier."""
+    visual tier. kind: whose sub-attribute counts besides drive_damage: 'npc' against aliens, 'pvp' against a bot counted as a player,
+    'factions' (PvP + against factions) against a bot of another company."""
+    keys = {'npc': ('drive_damage_npc',), 'pvp': ('drive_damage_pvp',), 'factions': ('drive_damage_pvp', 'drive_damage_factions')}[kind]
     rows = [(i, p.d['items'][str(i)]) for i in ids]
     big = [l for i, l in rows if DRIVES[l]['shot'] >= 2]
     mult, area = 1.0, DR['area']
@@ -365,7 +377,7 @@ def drive_power(p, ids):
     total = 0.0
     for i, l in rows:
         a = attrs(p, i)
-        d = DRIVES[l]['damage'] * (1 + 0.005 * (level(p, i) - 1)) * (1 + (a.get('drive_damage', 0) + a.get('drive_damage_npc', 0)) / 100.0)
+        d = DRIVES[l]['damage'] * (1 + 0.005 * (level(p, i) - 1)) * (1 + (a.get('drive_damage', 0) + sum(a.get(k, 0) for k in keys)) / 100.0)
         total += d * (mult if DRIVES[l]['shot'] >= 2 else 1.0)
     return total, area, max((DRIVES[l]['shot'] for i, l in rows), default=1)
 
@@ -476,7 +488,8 @@ class Shot:
             w.send([('AttackMissedCommand', dict(attackType=attack_type(CANNON_ATTACK), targetUserId=n.id, skillColorId=0))])
             return True
         dmg = base_damage(p, iid, p.ship()['lootId']) * (1 + 0.005 * (level(p, iid) - 1)) * SLUGS[slug]['multiplier']
-        dmg *= random.uniform(*C['damage_range']) * (1 + (a.get(DMG_KEY[e], 0) + a.get('cannon_damage_npc_' + e, 0) + shield_npc(p, e)) / 100.0)
+        bot = w.pvp_bot(n)                                    # a bot's ship: the PvP attributes instead of the alien ones
+        dmg *= random.uniform(*C['damage_range']) * (1 + cannon_bonus(p, a, e, bot, bot and w.enemy_bot(n)) / 100.0)
         dmg *= 1 + p.mods().get('top', 0)
         crit = random.random() < C['crit'] + a.get('cannon_strike_' + e, 0) / 100.0
         if crit:
@@ -551,8 +564,10 @@ class Shot:
         x, y = n.mover.pos(now)
         import ship_ability as SA
         bonus = SA.take(p, 'next_gsp')                 # Hyperion Quantum Amplifier: +10% on this shot
+        # the field hits aliens and bots alike: the damage is the alien one, a bot counted as a player takes it x the PvP ratio (field_factor)
+        ratio = {k: (drive_power(p, ids, k)[0] / power if power else 1.0) for k in ('pvp', 'factions')}
         zone = self.resonate({'x': x, 'y': y, 'end_time': now + DR['duration_sec'], 'next': now, 'damage': power * GSP[gsp] * (1 + bonus), 'target': n.id,
-                              'vm': vm, 'area': area}, now)
+                              'vm': vm, 'area': area, 'ratio': ratio}, now)
         self.zones.append(zone)
         w.send(w.ammo_msgs(gsp) + [('PlayVisualEffectCommand', dict(activatorId=w.hid, targetIds=[n.id], visualEffect=shot)),
                                    ('VisualModifierCommand', dict(userId=n.id, modifier=vm, attribute=0, additionalAttribute='', count=0,
@@ -599,7 +614,14 @@ class Shot:
             if z.get('slow'):                                          # Stagnation: slow while in the field (ends 1.2 s after leaving)
                 self.w.npc_effect(m, 'slow', 1.2, z['slow'], source='resonator')
             if random.random() < DR['hit']:
-                self.w.hit_npc(m.id, int(z['damage']), DRIVE_ATTACK)
+                self.w.hit_npc(m.id, int(z['damage'] * self.field_factor(z, m)), DRIVE_ATTACK)
+
+    def field_factor(self, z, m):
+        """The field's damage factor for this target: 1 for an alien; for a bot counted as a player the drives' PvP / alien power ratio
+        (with "against factions" if it is from another company)."""
+        if not self.w.pvp_bot(m):
+            return 1.0
+        return (z.get('ratio') or {}).get('factions' if self.w.enemy_bot(m) else 'pvp', 1.0)
 
     @staticmethod
     def zone_end(z):
@@ -627,7 +649,7 @@ class Shot:
                         for m in self.others(z['x'], z['y'], z['aftershock_area'], set(), now):
                             if self.w.hero_dead or self.zones is not zones:
                                 break
-                            self.w.hit_npc(m.id, int(z['aftershock_dmg']), DRIVE_ATTACK)
+                            self.w.hit_npc(m.id, int(z['aftershock_dmg'] * self.field_factor(z, m)), DRIVE_ATTACK)
                     # The client can cancel an effect by unit ID after that unit was removed.
                     self.w.send([self.zone_end(z)])
                 else:

@@ -95,6 +95,10 @@ SCHEMA = [
     _b('company_pvp', 'Attacking your own company', 'combat', "You can attack players and bots from your own company (as in the game): forbidden on your company's "
                                                              'X-1 and X-2 maps, destroying them brings a penalty. When off, you cannot attack your own company '
                                                              '(except clans at war).', default=True),
+    _b('bot_pvp', 'Bots count as players', 'combat', "Your hits on a bot's ship use the PvP values, as against a player: the lasers' and rockets' PvP "
+                                                    'damage, PvP ammo, PvP sets and the PvP bonuses (formations, drone designs, modules, QFC, P.E.T., '
+                                                    'particle weapons). When off, bots are hit like aliens and the bonuses against aliens apply.',
+       default=True),
     _c('radiation', 'Radiation damage', 'combat', 'Hull damage from radiation outside the map border. 0: radiation does no harm.', lo=0.0, hi=5.0, limit=100.0),
     _c('cbs_hp', 'Clan Battle Station HP', 'combat', "Health and shield of every Clan Battle Station module (yours, bot clans' and rival clans'). When "
                                                      "changed, the modules' current health scales proportionally; in-game bars refresh when you re-enter "
