@@ -1066,8 +1066,12 @@ def think(w, n, now):
     b = n.bot
     fire(w, n, now)
     if now < n.next_think:
-        if n.target is not None and now >= n.__dict__.get('next_move', 0):
-            keep_range(w, n, now)                        # in a fight it moves between its thoughts too
+        if now >= n.__dict__.get('next_move', 0):
+            if n.target is not None:
+                keep_range(w, n, now)                    # in a fight it moves between its thoughts too
+            elif getattr(n, 'shelter', None) is not None and n.__dict__.get('flee_to'):
+                n.next_move = now + combat_reaction(b)
+                flee_step(w, n, now)                     # and while fleeing
         return
     n.next_think = now + b.k['personality']['reaction_sec'] * random.uniform(0.6, 1.4)
     n.approaching = None                                 # set again if this thought is a fight (approach): keep_range follows it
@@ -1162,7 +1166,8 @@ def _power(w, uid):
     return m.bot.value()['power'] if m is not None and m.bot is not None else 1.0
 
 
-SAFE_MARGIN = (25, 90)         # kept beyond the alien's range: a sharp pilot cuts it fine, a novice keeps a wide berth
+SAFE_MARGIN = (25, 90)         # beyond the alien's range: a move that lands right keeps 25 (_placement); dodging several, a sharp
+                               # pilot keeps 25 more, a novice 90 (_margin)
 STICK = (120, 330)             # PvP: how close it stays to its target, so as not to lose it (aggressive and skilled: close)
 KITE_SPEED = 1.1               # it can keep out of an alien's range only if it is at least this much faster
 MINE_CLEAR = 45                # a path passes this far beyond a mine's trigger radius
@@ -1212,10 +1217,8 @@ def _pvp(w, uid):
 
 def combat_band(w, n, now):
     """(lo, goal, hi, kite): the distance the bot keeps from its target, and whether it circles it to stay there.
-    Against an alien: outside the alien's range and inside its own (the safe band), if the pilot knows that alien's range (the more
-    combat skill, the likelier; decided once per fight); otherwise its habit (playstyle range), as before. The skill also sets how
-    finely it cuts the margin and how well it leads the alien (approach). No safe band when the
-    alien outranges it (The Stinger 800, fixed turrets) or is about as fast (it cannot be kept at bay): it fights from its habit.
+    Against an alien: outside the alien's range and inside its own (the safe band): every pilot tries, it is instinctive; how well it
+    manages is the share of its moves that land too close or too far (_placement, combat skill). No safe band when the alien outranges it (The Stinger 800, fixed turrets) or is about as fast (it cannot be kept at bay): it fights from its habit.
     Against a player or a bot: it sticks to its target so as not to lose it; a sharp pilot who is not slower stays outside the radius of
     an enemy Smart Bomb that is ready (the bomb's 600 is inside the lasers' 700). Before, every fight was at the habit distance, whatever
     the alien's range, and the bot moved again only beyond it + 120."""
@@ -1235,17 +1238,37 @@ def combat_band(w, n, now):
         return 60, goal, goal + 150, False
     sk = PL.skill(b, 'combat')
     er = enemy_reach(w, t) or 0
-    lo_s = er + _margin(sk)
-    hi_s = reach - 20 - 40 * (1 - sk)
+    lo_s, hi_s = er + SAFE_MARGIN[0], reach - 20
     if lo_s >= hi_s or (speed > 0 and n.speed() < speed * KITE_SPEED):
         return 120, min(habit, reach - 60), min(habit + 120, reach - 20), False
-    knows = n.__dict__.get('knows')
-    if knows is None or knows[0] != t:                   # does it know this alien's range: decided once per fight (never as a novice,
-        knows = n.knows = (t, random.random() < (sk - 0.15) / 0.45)      # always from 0.6: practice)
-    if not knows[1]:
-        return 120, min(habit, reach - 60), min(habit + 120, reach - 20), False
-    goal = max(lo_s, min(hi_s, (lo_s + hi_s) / 2))
-    return lo_s, goal, hi_s, True
+    return lo_s, (lo_s + hi_s) / 2, hi_s, True
+
+
+def placement_odds(sk, fleeing=False, hit=False):
+    """(too close, right, too far): the shares of a pilot's moves (combat skill sk). The worst pilot lands a third of them too close
+    (in the alien's range), a third right, a third too far (out of its own range); a perfect one all right. Fleeing (low HP, running to
+    a shelter) is much harder: the errors double, too close first (0: two thirds too close, a third too far). Just hit (not fleeing):
+    it backs off at once, so that move is never too close (0: half right, half too far). Player's model 2026-11-22."""
+    e = (1 - max(0.0, min(1.0, sk))) / 3
+    close = far = e
+    if fleeing:
+        close = min(1.0, 2 * e)
+        far = min(2 * e, 1.0 - close)
+    elif hit:
+        return 0.0, (1 - 2 * e) / (1 - e), e / (1 - e)  # the too close share taken out: the rest in the same ratio
+    return close, 1.0 - close - far, far
+
+
+def _placement(n, lo, hi, er, sk, fleeing=False, hit=False):
+    """The distance its next move aims at (approach): drawn from placement_odds. Too close: inside the alien's range (er), too far:
+    beyond its own (hi, it cannot fire), right: in the band."""
+    close, right, far = placement_odds(sk, fleeing, hit)
+    x = random.random()
+    if x < close:
+        return max(60.0, er - random.uniform(20, 180))
+    if x < close + right:
+        return random.uniform(lo, hi)
+    return hi + random.uniform(20, 200)
 
 
 def _mines(w, now):
@@ -1295,11 +1318,11 @@ def _steer(w, n, cx, cy, radius, a, now, turn=1, threshold=40):
     _go_to(w, n, x, y, now, threshold=threshold)
 
 
-def approach(w, n, pos, now):
+def approach(w, n, pos, now, hit=None):
     """Combat movement: keeps the distance of combat_band from its target. A sharp pilot aims where the target will be (its movement is
     known: _track), a novice where it is. Circling (kite): one chord of the circle around where the target will be at a time, so it stays
     in the band while the alien chases it; between thoughts keep_range keeps it going. Not circling: as before, back to its distance when
-    it leaves the band, and now and then a small circle step."""
+    it leaves the band, and now and then a small circle step. hit: the alien that just hit it (keep_range): it backs away from it."""
     b = n.bot
     lo, goal, hi, kite = combat_band(w, n, now)
     sk = PL.skill(b, 'pvp' if _pvp(w, n.target) else 'combat')
@@ -1311,8 +1334,9 @@ def approach(w, n, pos, now):
     lead = seg * min(1.0, 1.3 * sk) if sk > 0.25 else 0.0
     tx, ty = pos
     m = w.npcs.get(n.target)
-    if lead and m is not None and m.bot is None and m.bot_target == n.id and cur > 1:
-        tx, ty = pos[0] + (nx - pos[0]) / cur * speed * lead, pos[1] + (ny - pos[1]) / cur * speed * lead     # it chases: comes at it
+    if m is not None and m.bot is None and m.bot_target == n.id and cur > 1:
+        # it chases: comes at it. Backing off from it is instinctive (every pilot allows for it); the misses are placement_odds'
+        tx, ty = pos[0] + (nx - pos[0]) / cur * speed * seg, pos[1] + (ny - pos[1]) / cur * speed * seg
     elif lead and mover is not None:
         tx, ty = mover.pos(now + lead)                   # otherwise along its known movement
     a = math.atan2(ny - ty, nx - tx)
@@ -1325,12 +1349,19 @@ def approach(w, n, pos, now):
             _steer(w, n, tx, ty, goal, a + d * random.uniform(0.25, 0.6), now, threshold=40)
         return
     threats = _threats(w, n, now) if random.random() < (sk - 0.4) / 0.3 else []      # watches the others after it too (skill)
-    if lo <= cur <= hi and n.mover.t1 > now + 0.15 and not _exposed(n, threats, now, sk):
-        return                                           # on its way along the circle, in the band
+    if hit is None and n.mover.t1 > now + 0.15 and not _exposed(n, threats, now, sk):
+        return                                           # on its way: the next move when this one ends (keep_range)
+    er = enemy_reach(w, n.target) or 0
     n.step = 2 * math.asin(min(0.9, n.speed() * seg / (2 * goal)))
     if len(threats) > 1:
-        return _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk)
-    _steer(w, n, tx, ty, goal, a + d * n.step, now, threshold=25)
+        return _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk, er if hit is None else None)
+    h = w.npcs.get(hit) if hit is not None and hit != n.target else None
+    if h is not None:                                    # hit by another alien: straight away from it, as far as its range
+        hx, hy = h.mover.pos(now)
+        rr = _placement(n, w.npc_range(h) + SAFE_MARGIN[0], w.npc_range(h) + 120, w.npc_range(h), sk, hit=True)
+        return _steer(w, n, hx, hy, rr, math.atan2(ny - hy, nx - hx) + d * 0.3, now, turn=0, threshold=25)
+    rr = _placement(n, lo, hi, er, sk, hit=hit is not None)
+    _steer(w, n, tx, ty, rr, a + d * n.step * (0.5 if hit is not None else 1.0), now, threshold=25)
 
 
 def _threats(w, n, now, reach=1500):
@@ -1355,11 +1386,12 @@ def _exposed(n, threats, now, sk):
     return any(math.hypot(x - nx, y - ny) < r + 0.5 * _margin(sk) for x, y, r, v in threats)
 
 
-def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk):
+def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk, er=None):
     """Several aliens after it: of the points it could reach in one move (on its circle round the target, a little wider, or straight
     away from the pack), the one that leaves it least in their ranges where they will be (they come at it), while it can still shoot
     its target. Running straight away makes the chasers bunch up behind it (they all come at it from the same side); once bunched,
-    the circle round the target is clear of them all again and it circles the pack."""
+    the circle round the target is clear of them all again and it circles the pack. The chosen point then misses like any move
+    (placement_odds: too close to the nearest alien, or too far); er None: just hit, it does not land too close."""
     nx, ny = n.mover.pos(now)
     v = n.speed()
     margin = _margin(sk)
@@ -1386,7 +1418,7 @@ def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk):
         for fx, fy, r in future:
             for qx, qy in ((px, py), ((px + nx) / 2, (py + ny) / 2)):     # where it ends and halfway there
                 cost += max(0.0, r + margin - math.hypot(qx - fx, qy - fy))
-        cost += 0.5 * max(0.0, math.hypot(px - tx, py - ty) - reach)     # out of its own range: no damage done
+        cost += 0.7 * max(0.0, math.hypot(px - tx, py - ty) - reach)     # out of its own range: no damage done
         cost += 0.25 * max(0.0, 1200 - min(px, py, w.map_w - px, w.map_h - py))      # towards an edge or a corner it cannot get out of
         if back:
             cost += 15                                   # turning back on its circle
@@ -1396,28 +1428,45 @@ def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk):
             best = (cost, px, py, back)
     if best[3]:
         n.orbit_direction = -d
-    _go_to(w, n, best[1], best[2], now, threshold=25)
+    px, py = best[1], best[2]
+    close, right, far = placement_odds(sk, hit=er is None)
+    x = random.random()
+    if x < close or x >= close + right:
+        fx, fy, r = min(future, key=lambda f: math.hypot(px - f[0], py - f[1]))
+        dist = max(1.0, math.hypot(px - fx, py - fy))
+        want = max(60.0, r - random.uniform(20, 180)) if x < close else dist + random.uniform(80, 250)
+        px, py = fx + (px - fx) / dist * want, fy + (py - fy) / dist * want
+    _go_to(w, n, px, py, now, threshold=25)
+
+
+def combat_reaction(b):
+    """Reaction time in a fight (s): about 0.2-0.45 (a human's is about 0.25). The personality's reaction_sec (0.35-2) is the pace of its
+    decisions (thoughts, invitations), much slower."""
+    return 0.15 + 0.15 * b.k['personality']['reaction_sec']
 
 
 def keep_range(w, n, now):
-    """Between two thoughts, while it fights a target it approached: once its move ends or it leaves the band, the next move (approach).
-    How soon it reacts: its reaction time, shorter for a sharp pilot."""
+    """Between two thoughts, while it fights a target it approached: the next move once this one ends (approach); hit by an alien, it
+    backs off after its combat reaction time (never too close then: placement_odds); a sharp pilot also moves when one of the aliens
+    after it is about to reach it (_exposed)."""
     t = n.target
     last = n.__dict__.get('approaching')
     if t is None or last is None or last[0] != t or now - last[1] > 3:
         return
-    sk = PL.skill(n.bot, 'pvp' if _pvp(w, t) else 'combat')
-    n.next_move = now + n.bot.k['personality']['reaction_sec'] * (0.25 + 0.5 * (1 - sk))
-    if random.random() < 0.08 * (1 - PL.skill(n.bot, 'focus')) * (1.2 - sk):
-        n.next_move += random.uniform(1.0, 3.0)          # a lapse: looks at the minimap, the chat, the loot (focus)
+    b = n.bot
+    sk = PL.skill(b, 'pvp' if _pvp(w, t) else 'combat')
+    n.next_move = now + combat_reaction(b)
     pos = _position(w, t, now)
     if pos is None:
         return
+    if n.last_damage > n.__dict__.get('backed', 0) and now >= n.last_damage + combat_reaction(b):
+        n.backed = now
+        u = max(n.attacker, key=n.attacker.get) if n.attacker else None
+        if u in w.npcs and w.npcs[u].bot is None and combat_band(w, n, now)[3]:
+            return approach(w, n, pos, now, hit=u)
     if n.mover.t1 <= now + 0.1:
         return approach(w, n, pos, now)
-    lo, _, hi, kite = combat_band(w, n, now)
-    nx, ny = n.mover.pos(now)
-    if not lo <= math.hypot(pos[0] - nx, pos[1] - ny) <= hi or (kite and sk > 0.4 and _exposed(n, _threats(w, n, now), now, sk)):
+    if sk > 0.4 and combat_band(w, n, now)[3] and _exposed(n, _threats(w, n, now), now, sk):
         approach(w, n, pos, now)
 
 
@@ -1559,8 +1608,11 @@ def flee(w, n, now):
         d = math.hypot(nx - cx, ny - cy)
         if d > r * 0.8:
             k = r * 0.5 / max(1.0, d)
-            _go_to(w, n, cx + (nx - cx) * k, cy + (ny - cy) * k, now)      # straight in, on its near side
+            n.flee_to = (cx + (nx - cx) * k, cy + (ny - cy) * k)
+            if not flee_step(w, n, now):
+                _go_to(w, n, n.flee_to[0], n.flee_to[1], now)      # straight in, on its near side
             return True
+        n.flee_to = None                                             # in its shelter
         gate = next((g for g in _exits(w, b) if (g['x'], g['y']) == (cx, cy)), None)
         if not (jumps and gate and now - n.last_damage < SHELTER_HIT_SEC):
             return True                                              # in the shelter: waits (the hits stop, it recovers)
@@ -1568,7 +1620,7 @@ def flee(w, n, now):
         b.en_route = [gate['target']]
     gs = _exits(w, b)
     if not gs:
-        n.shelter = None
+        n.shelter = n.flee_to = None
         return False
     g = min(gs, key=lambda g: math.hypot(g['x'] - nx, g['y'] - ny))
     if not jumps:
@@ -1580,11 +1632,33 @@ def flee(w, n, now):
     return True
 
 
+def flee_step(w, n, now):
+    """Running to its shelter with aliens after it: one move at a time, each drawn like a fighting move but fleeing (placement_odds:
+    the errors double, too close first; no backing off when hit): too close, a zigzag that lets the nearest chaser in range; right or
+    too far, straight to the shelter. -> handled (False: nobody after it, it flies straight)."""
+    to = n.__dict__.get('flee_to')
+    chasers = _threats(w, n, now, reach=1200)
+    if to is None or not chasers:
+        return False
+    if n.mover.t1 > now + 0.1:
+        return True                                      # this move is not over yet
+    nx, ny = n.mover.pos(now)
+    fx, fy, r, v = min(chasers, key=lambda c: math.hypot(c[0] - nx, c[1] - ny))
+    close, right, far = placement_odds(PL.skill(n.bot, 'combat'), fleeing=True)
+    if random.random() >= close:
+        _go_to(w, n, to[0], to[1], now)                  # right or too far: on its way out of their reach
+        return True
+    rr = max(60.0, r - random.uniform(20, 180))
+    a = math.atan2(to[1] - fy, to[0] - fx) + random.uniform(-0.6, 0.6)
+    _go_to(w, n, fx + math.cos(a) * rr, fy + math.sin(a) * rr, now, threshold=25)
+    return True
+
+
 def sheltering(w, n, now, d):
     """A fled bot (n.shelter) keeps fleeing until it has recovered (SHELTER_RESUME) and nobody hits it: a heal over the flee threshold
     (Backup Shields, Battle Repair) or a pause in the hits no longer turns it back on the aliens (user report 2026-11-03) -> handled."""
     if is_gate_world(w):
-        n.shelter = None
+        n.shelter = n.flee_to = None
         return False
     attackers = [u for u, t in n.attacker.items() if now - t < 6]
     ratio = (n.hp + n.shield) / max(1, d['hp'] + d['shield'])
@@ -1593,7 +1667,7 @@ def sheltering(w, n, now, d):
         if AC.combat(w, n, now, d, ratio, attackers):     # Insta-Shield, Backup Shields, Battle Repair … while fleeing too
             ratio = (n.hp + n.shield) / max(1, d['hp'] + d['shield'])
     if ratio >= SHELTER_RESUME and not attackers:
-        n.shelter = None
+        n.shelter = n.flee_to = None
         return False
     return flee(w, n, now)
 
