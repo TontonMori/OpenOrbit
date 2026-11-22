@@ -145,6 +145,8 @@ def incoming(bot, m):
         bot.pending.append(('group', m[1]['inviterId'], m[1].get('inviterName', ''), time.time()))
     elif m[0] in ('GroupInitializationCommand', 'GroupMemberInitializationCommand'):
         bot.pending.append(('group_formed', 0, '', 0.0))   # (the bot invited, accepted): to the leader's side (tick)
+    elif m[0] == 'MemberLeaveCommand' and int(m[1].get('reason') or 0) == 2:      # group.KICKED
+        bot.pending.append(('kicked', int(m[1].get('playerId') or 0), '', 0.0))      # (tick: _kicked)
 
 
 _PEOPLE = {'t': 0.0, 'd': {}, 'y': None}
@@ -251,6 +253,9 @@ def invites(y, b, now):
         if kind == 'group_formed':
             _group_up(y, b, now)
             continue
+        if kind == 'kicked':
+            _kicked(b, uid, now)
+            continue
         if kind != 'group' or not y.permission('group'):
             continue
         k = person(b)
@@ -271,6 +276,14 @@ def invites(y, b, now):
     b.pending = remaining
 
 
+def _kicked(b, uid, now):
+    """Someone was kicked out of the bot's group: its mates do not invite it back for KICK_GAP (party); if it is the bot itself, it
+    does not pester those who threw it out either."""
+    shunned = b.__dict__.setdefault('shunned', {})
+    for x in ([uid] if uid != b.uid else b.__dict__.get('mates', ())):
+        shunned[x] = now + KICK_GAP
+
+
 def _group_up(y, b, now):
     """The bot joined a group (its own invitation was accepted): goes to the group's human player (goals/group.py)."""
     from .goals import group as GG
@@ -285,6 +298,7 @@ def _group_up(y, b, now):
 
 PARTY_MIN = (20 * 60, 100 * 60)          # how long a bot-only group hunts together before someone leaves
 PARTY_SIZE = (2, 5)                      # a bot leader fills its bot-only party up to this many (random per party)
+KICK_GAP = 12 * 3600                     # a pilot kicked out of a group is not invited again by its mates for this long
 PAIR_GAP = 3 * 3600                      # a bot does not invite the same player again for this long (a refusal or an ignored invite)
 BUSY = ('gate', 'mode', 'pvp_match', 'duel')      # jobs a pilot does not drop for a group
 HUMAN_INVITE = {}                        # player uid -> last bot invitation sent to them (bot_invite_gap)
@@ -386,14 +400,21 @@ def party(y, b, now):
     leader of a bot-only party with room) invites someone with the same aim (same map, same job), friendly (company, clan, alliance,
     friends) and as strong or stronger (standing; a helpful pilot also takes weaker ones): players near it, in its clan or friends too, a
     strong player more often. Another company only where diplomacy allows (4-5 and 5-X; allied clans). The invited one decides with
-    decide_group. A bot-only party breaks up after a while. Invitations to a player: at most one every bot_invite_gap seconds per player
+    decide_group. A bot-only party breaks up after a while; its strongest, most convincing pilot leads it (_hand_over). In a player's
+    group the bots recruit (other bots) only if he lets everyone invite. A pilot kicked out of a group is not invited again by its
+    mates for KICK_GAP, nor does it invite them (_kicked). Invitations to a player: at most one every bot_invite_gap seconds per player
     (0: none), never twice from the same bot within PAIR_GAP. Before, only a friend or acquaintance of the same company was invited,
     about once in four hours per bot, and never a player (player request 2026-11-22)."""
     import group as GR
     import community as TP
     from . import playstyle as PL
     g = GR.group_of(b.uid)
+    humans = []
+    shunned = b.__dict__.setdefault('shunned', {})
+    for u in [u for u, t in shunned.items() if t < now]:
+        del shunned[u]
     if g is not None:
+        b.mates = [u for u in g.members if u != b.uid]   # who threw it out, if it gets kicked (_kicked)
         humans = [u for u in g.members if _human(u)]
         until = b.__dict__.get('party_until')
         if not humans and until is not None and now > until:
@@ -402,9 +423,22 @@ def party(y, b, now):
             b.party_cd = now + b.r.uniform(1800, 2 * 3600)     # does not form a new group right away
             b.event('left_group', now)
             return
-        size = b.__dict__.setdefault('party_size', b.r.randint(*PARTY_SIZE))
-        if humans or g.leader != b.uid or len(g.members) >= size or len(g.members) >= GR.MAX_COUNT:
-            return                                       # only the leader of a bot-only party with room keeps recruiting
+        if not humans and g.leader == b.uid and _hand_over(y, b, g, now):
+            return
+        if len(g.members) >= GR.MAX_COUNT:
+            return
+        if humans:                                       # a player's group: its bots recruit only if he lets everyone invite
+            if g.mod != GR.MODE_EVERYONE:
+                return
+        else:
+            size = b.__dict__.get('party_size') or b.r.randint(*PARTY_SIZE)
+            b.party_size = size
+            if g.leader != b.uid or len(g.members) >= size:
+                return                                   # in a bot-only party only the leader recruits, up to its size
+        for u in g.members:                              # nor anyone a mate saw kicked out
+            o = _bot_of(y, u) if u != b.uid and not _human(u) else None
+            if o is not None:
+                shunned.update((x, t) for x, t in o.__dict__.get('shunned', {}).items() if t > shunned.get(x, 0))
     if now < b.__dict__.get('party_cd', 0):
         return
     if b.target is None or b.target.name not in ('grinding', 'quest', 'resting', 'exploring', 'pvp', 'group'):
@@ -416,10 +450,10 @@ def party(y, b, now):
     gap = y.setting('bot_invite_gap', 90)
     asked = b.__dict__.setdefault('asked', {})
     cands = []
-    for k in TP.all_().values():                         # players: those near, clanmates and friends anywhere
+    for k in ([] if humans else TP.all_().values()):     # players: those near, clanmates and friends anywhere
         if not _human(k.uid) or k.session is None or k.profile is None or GR.group_of(k.uid) is not None:
             continue
-        if not gap or now - HUMAN_INVITE.get(k.uid, 0) < gap or now - asked.get(k.uid, 0) < PAIR_GAP:
+        if not gap or k.uid in shunned or now - HUMAN_INVITE.get(k.uid, 0) < gap or now - asked.get(k.uid, 0) < PAIR_GAP:
             continue
         same_map, clan, friend = _map_of(k) == my_map, _clan_id(k), k.name in friends
         if not (same_map or friend or (clan is not None and clan == b.k.get('clan'))):
@@ -430,7 +464,7 @@ def party(y, b, now):
         score = 0.5 * same_map + 0.4 * friend + d + _appeal(b, _power_of(y, k)) + b.memory.relation(k.name, now)
         cands.append((score, k.uid, k.name, None))
     for o in y.bots:                                     # bots: the same aim
-        if o is b or not o.online or o.dead_until > now or GR.group_of(o.uid) is not None:
+        if o is b or not o.online or o.dead_until > now or o.uid in shunned or GR.group_of(o.uid) is not None:
             continue
         same_map, clan, friend = o.game_map == b.game_map, o.k.get('clan'), o.name in friends
         if not (same_map or friend or (clan is not None and clan == b.k.get('clan'))):
@@ -452,9 +486,30 @@ def party(y, b, now):
     if g is None:
         b.party_until = now + b.r.uniform(*PARTY_MIN)
         b.party_size = b.r.randint(*PARTY_SIZE)
-    if o is not None:
+    if o is not None and not humans:
         o.party_until = (b.__dict__.get('party_until') or now + PARTY_MIN[0]) + b.r.uniform(-600, 600)
     b.event('group_invite', now, name=name)
+
+
+def _lead(b):
+    """How fit a bot is to lead a party: its power, and its sociability (a convincing recruiter)."""
+    return b.value()['power'] * (0.75 + 0.5 * b.o('sociability'))
+
+
+def _hand_over(y, b, g, now):
+    """In a bot-only party the strongest and most convincing pilot leads (it recruits): the leader hands over when a member is clearly
+    fitter (hysteresis, so they do not swap back and forth), with its plans for the party (until when, how many)."""
+    import group as GR
+    best = max((o for o in (_bot_of(y, u) for u in g.members if u != b.uid) if o is not None), key=_lead, default=None)
+    if best is None or _lead(best) <= 1.15 * _lead(b):
+        return False
+    GR.handle(person(b), 'ChangeLeaderRequest', {'memberId': best.uid})
+    if g.leader != best.uid:
+        return False
+    best.party_until = b.__dict__.get('party_until') or best.__dict__.get('party_until')
+    best.party_size = b.__dict__.get('party_size') or best.__dict__.get('party_size') or best.r.randint(*PARTY_SIZE)
+    b.event('group_leader', now, name=best.name)
+    return True
 
 
 def decide_group(y, b, name, uid, now):
