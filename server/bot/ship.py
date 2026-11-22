@@ -1244,31 +1244,49 @@ def combat_band(w, n, now):
     return lo_s, (lo_s + hi_s) / 2, hi_s, True
 
 
-def placement_odds(sk, fleeing=False, hit=False):
-    """(too close, right, too far): the shares of a pilot's moves (combat skill sk). The worst pilot lands a third of them too close
-    (in the alien's range), a third right, a third too far (out of its own range); a perfect one all right. Fleeing (low HP, running to
-    a shelter) is much harder: the errors double, too close first (0: two thirds too close, a third too far). Just hit (not fleeing):
-    it backs off at once, so that move is never too close (0: half right, half too far). Player's model 2026-11-22."""
-    e = (1 - max(0.0, min(1.0, sk))) / 3
-    close = far = e
-    if fleeing:
-        close = min(1.0, 2 * e)
-        far = min(2 * e, 1.0 - close)
-    elif hit:
-        return 0.0, (1 - 2 * e) / (1 - e), e / (1 - e)  # the too close share taken out: the rest in the same ratio
-    return close, 1.0 - close - far, far
+AIM_SPREAD = 120               # spread (px, standard deviation) of the worst pilot's moves around the distance it aims at: against a
+                               # Kristallon (right band 575-680) a third too close, a third right, a third too far (player's model
+                               # 2026-11-22); none for a perfect pilot. Against an alien with a short range the band is wide: few misses
 
 
-def _placement(n, lo, hi, er, sk, fleeing=False, hit=False):
-    """The distance its next move aims at (approach): drawn from placement_odds. Too close: inside the alien's range (er), too far:
-    beyond its own (hi, it cannot fire), right: in the band."""
-    close, right, far = placement_odds(sk, fleeing, hit)
-    x = random.random()
-    if x < close:
-        return max(60.0, er - random.uniform(20, 180))
-    if x < close + right:
-        return random.uniform(lo, hi)
-    return hi + random.uniform(20, 200)
+def aim_spread(sk, fleeing=False):
+    """How far off its moves land (px): AIM_SPREAD for the worst pilot, 0 for a perfect one; twice as much when fleeing."""
+    s = AIM_SPREAD * (1 - max(0.0, min(1.0, sk)))
+    return 2 * s if fleeing else s
+
+
+def _miss(sk, below, hit=False):
+    """The error of one move (px, positive: farther). Just hit, it backs off: never more than `below` closer (it does not go back into
+    range; the rest of the misses as they come, so the worst pilot then lands half right, half too far)."""
+    s = aim_spread(sk)
+    if s <= 0:
+        return 0.0
+    for _ in range(10):
+        e = random.gauss(0, s)
+        if not hit or e >= -below:
+            return e
+    return abs(e)
+
+
+def _placement(n, lo, hi, sk, hit=False):
+    """The distance its next move aims at (approach): the middle of the band, off by _miss. Below lo: in the alien's range, above hi:
+    out of its own."""
+    goal = (lo + hi) / 2
+    return max(60.0, goal + _miss(sk, goal - lo, hit))
+
+
+def placement_odds(sk, width, fleeing=False):
+    """(too close, right, too far): the shares of its moves for a band this wide (px). Fleeing (low HP, running to a shelter) the
+    spread doubles and the moves drift closer (it zigzags while looking where to go): the worst pilot about 60 % too close against a
+    Kristallon."""
+    s = aim_spread(sk, fleeing)
+    if s <= 0:
+        return 0.0, 1.0, 0.0
+    shift = -aim_spread(sk) if fleeing else 0.0
+    phi = lambda z: 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    close = phi((-width / 2 - shift) / s)
+    far = 1 - phi((width / 2 - shift) / s)
+    return close, 1 - close - far, far
 
 
 def _mines(w, now):
@@ -1335,7 +1353,7 @@ def approach(w, n, pos, now, hit=None):
     tx, ty = pos
     m = w.npcs.get(n.target)
     if m is not None and m.bot is None and m.bot_target == n.id and cur > 1:
-        # it chases: comes at it. Backing off from it is instinctive (every pilot allows for it); the misses are placement_odds'
+        # it chases: comes at it. Backing off from it is instinctive (every pilot allows for it); the misses are _miss'
         tx, ty = pos[0] + (nx - pos[0]) / cur * speed * seg, pos[1] + (ny - pos[1]) / cur * speed * seg
     elif lead and mover is not None:
         tx, ty = mover.pos(now + lead)                   # otherwise along its known movement
@@ -1358,9 +1376,9 @@ def approach(w, n, pos, now, hit=None):
     h = w.npcs.get(hit) if hit is not None and hit != n.target else None
     if h is not None:                                    # hit by another alien: straight away from it, as far as its range
         hx, hy = h.mover.pos(now)
-        rr = _placement(n, w.npc_range(h) + SAFE_MARGIN[0], w.npc_range(h) + 120, w.npc_range(h), sk, hit=True)
+        rr = _placement(n, w.npc_range(h) + SAFE_MARGIN[0], w.npc_range(h) + 120, sk, hit=True)
         return _steer(w, n, hx, hy, rr, math.atan2(ny - hy, nx - hx) + d * 0.3, now, turn=0, threshold=25)
-    rr = _placement(n, lo, hi, er, sk, hit=hit is not None)
+    rr = _placement(n, lo, hi, sk, hit=hit is not None)
     _steer(w, n, tx, ty, rr, a + d * n.step * (0.5 if hit is not None else 1.0), now, threshold=25)
 
 
@@ -1391,35 +1409,41 @@ def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk, er=None):
     away from the pack), the one that leaves it least in their ranges where they will be (they come at it), while it can still shoot
     its target. Running straight away makes the chasers bunch up behind it (they all come at it from the same side); once bunched,
     the circle round the target is clear of them all again and it circles the pack. The chosen point then misses like any move
-    (placement_odds: too close to the nearest alien, or too far); er None: just hit, it does not land too close."""
+    (_miss, off from the nearest alien); er None: just hit, it does not go back into range."""
     nx, ny = n.mover.pos(now)
     v = n.speed()
     margin = _margin(sk)
     reach = weapon_reach(w, n, now) - 15
     d = n.__dict__.get('orbit_direction', 1)
-    future = [(x + (nx - x) / max(1.0, math.hypot(nx - x, ny - y)) * s * lead,
-               y + (ny - y) / max(1.0, math.hypot(nx - x, ny - y)) * s * lead, r) for x, y, r, s in threats]
+    future = [(x + (nx - x) / max(1.0, math.hypot(nx - x, ny - y)) * s * seg,
+               y + (ny - y) / max(1.0, math.hypot(nx - x, ny - y)) * s * seg, r) for x, y, r, s in threats]
     cx, cy = sum(f[0] for f in future) / len(future), sum(f[1] for f in future) / len(future)
     away = math.atan2(ny - cy, nx - cx)
     cands = [(tx + math.cos(a + d * k * n.step) * rr, ty + math.sin(a + d * k * n.step) * rr, k < 0)
              for k in (-2, -1, 1, 2, 3) for rr in (goal, goal + 70)]
     cands += [(nx + math.cos(away + e) * v * seg, ny + math.sin(away + e) * v * seg, False) for e in (-0.6, -0.3, 0.0, 0.3, 0.6)]
+    cands += [(nx + math.cos(k * math.pi / 6) * v * seg, ny + math.sin(k * math.pi / 6) * v * seg, False) for k in range(12)]   # any way out
     ring = max(math.hypot(fx - cx, fy - cy) + r for fx, fy, r in future) + margin     # round the pack, out of reach of all of them
     da = 2 * math.asin(min(0.9, v * seg / (2 * ring)))
-    cands += [(cx + math.cos(away + d * k * da) * ring, cy + math.sin(away + d * k * da) * ring, k < 0) for k in (-1, 1, 2)]
+    cands += [(x, y, back) for x, y, back in ((cx + math.cos(away + d * k * da) * ring, cy + math.sin(away + d * k * da) * ring, k < 0)
+                                              for k in (-1, 1, 2)) if math.hypot(x - nx, y - ny) < 1.5 * v * seg]     # not across the pack
     mines = _mines(w, now) if random.random() < 0.35 + 0.65 * PL.skill(n.bot, 'survival') else ()
     if mines:
         import combat_items as CI
         rm = CI.S['mine']['trigger'] + MINE_CLEAR
     best = None
     for px, py, back in cands:
+        step = math.hypot(px - nx, py - ny)
+        if step > 1.5 * v * seg:                         # one short move at a time: it looks again before going on
+            px, py = nx + (px - nx) * 1.5 * v * seg / step, ny + (py - ny) * 1.5 * v * seg / step
         px, py = max(200, min(w.map_w - 200, px)), max(200, min(w.map_h - 200, py))      # where _go_to really sends it
         cost = 0.0
         for fx, fy, r in future:
-            for qx, qy in ((px, py), ((px + nx) / 2, (py + ny) / 2)):     # where it ends and halfway there
+            for f in (1 / 3, 2 / 3, 1.0):                                  # along the way and where it ends
+                qx, qy = nx + (px - nx) * f, ny + (py - ny) * f
                 cost += max(0.0, r + margin - math.hypot(qx - fx, qy - fy))
         cost += 0.7 * max(0.0, math.hypot(px - tx, py - ty) - reach)     # out of its own range: no damage done
-        cost += 0.25 * max(0.0, 1200 - min(px, py, w.map_w - px, w.map_h - py))      # towards an edge or a corner it cannot get out of
+        cost += 0.2 * max(0.0, 2500 - min(px, py, w.map_w - px, w.map_h - py))       # towards an edge or a corner it cannot get out of
         if back:
             cost += 15                                   # turning back on its circle
         if mines and not _clear(nx, ny, px, py, mines, rm):
@@ -1429,13 +1453,10 @@ def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk, er=None):
     if best[3]:
         n.orbit_direction = -d
     px, py = best[1], best[2]
-    close, right, far = placement_odds(sk, hit=er is None)
-    x = random.random()
-    if x < close or x >= close + right:
-        fx, fy, r = min(future, key=lambda f: math.hypot(px - f[0], py - f[1]))
-        dist = max(1.0, math.hypot(px - fx, py - fy))
-        want = max(60.0, r - random.uniform(20, 180)) if x < close else dist + random.uniform(80, 250)
-        px, py = fx + (px - fx) / dist * want, fy + (py - fy) / dist * want
+    fx, fy, r = min(future, key=lambda f: math.hypot(px - f[0], py - f[1]))
+    dist = max(1.0, math.hypot(px - fx, py - fy))
+    want = max(60.0, dist + _miss(sk, max(0.0, dist - r - SAFE_MARGIN[0]), hit=er is None))
+    px, py = fx + (px - fx) / dist * want, fy + (py - fy) / dist * want
     _go_to(w, n, px, py, now, threshold=25)
 
 
@@ -1447,7 +1468,7 @@ def combat_reaction(b):
 
 def keep_range(w, n, now):
     """Between two thoughts, while it fights a target it approached: the next move once this one ends (approach); hit by an alien, it
-    backs off after its combat reaction time (never too close then: placement_odds); a sharp pilot also moves when one of the aliens
+    backs off after its combat reaction time (not back into range then: _miss); a sharp pilot also moves when one of the aliens
     after it is about to reach it (_exposed)."""
     t = n.target
     last = n.__dict__.get('approaching')
@@ -1634,7 +1655,7 @@ def flee(w, n, now):
 
 def flee_step(w, n, now):
     """Running to its shelter with aliens after it: one move at a time, each drawn like a fighting move but fleeing (placement_odds:
-    the errors double, too close first; no backing off when hit): too close, a zigzag that lets the nearest chaser in range; right or
+    twice the spread, drifting closer; no backing off when hit): too close, a zigzag that lets the nearest chaser in range; right or
     too far, straight to the shelter. -> handled (False: nobody after it, it flies straight)."""
     to = n.__dict__.get('flee_to')
     chasers = _threats(w, n, now, reach=1200)
@@ -1644,11 +1665,13 @@ def flee_step(w, n, now):
         return True                                      # this move is not over yet
     nx, ny = n.mover.pos(now)
     fx, fy, r, v = min(chasers, key=lambda c: math.hypot(c[0] - nx, c[1] - ny))
-    close, right, far = placement_odds(PL.skill(n.bot, 'combat'), fleeing=True)
+    sk = PL.skill(n.bot, 'combat')
+    width = max(50.0, weapon_reach(w, n, now) - 20 - r - SAFE_MARGIN[0])      # the band it would keep in a fight
+    close, right, far = placement_odds(sk, width, fleeing=True)
     if random.random() >= close:
         _go_to(w, n, to[0], to[1], now)                  # right or too far: on its way out of their reach
         return True
-    rr = max(60.0, r - random.uniform(20, 180))
+    rr = max(60.0, r - abs(random.gauss(0, aim_spread(sk))))
     a = math.atan2(to[1] - fy, to[0] - fx) + random.uniform(-0.6, 0.6)
     _go_to(w, n, fx + math.cos(a) * rr, fy + math.sin(a) * rr, now, threshold=25)
     return True
