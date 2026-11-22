@@ -1066,8 +1066,11 @@ def think(w, n, now):
     b = n.bot
     fire(w, n, now)
     if now < n.next_think:
+        if n.target is not None and now >= n.__dict__.get('next_move', 0):
+            keep_range(w, n, now)                        # in a fight it moves between its thoughts too
         return
     n.next_think = now + b.k['personality']['reaction_sec'] * random.uniform(0.6, 1.4)
+    n.approaching = None                                 # set again if this thought is a fight (approach): keep_range follows it
     d = b.value()
     if now - n.last_damage > COMBAT_SEC:                     # yenilenme
         from . import extras as EX
@@ -1159,22 +1162,263 @@ def _power(w, uid):
     return m.bot.value()['power'] if m is not None and m.bot is not None else 1.0
 
 
+SAFE_MARGIN = (25, 90)         # kept beyond the alien's range: a sharp pilot cuts it fine, a novice keeps a wide berth
+STICK = (120, 330)             # PvP: how close it stays to its target, so as not to lose it (aggressive and skilled: close)
+KITE_SPEED = 1.1               # it can keep out of an alien's range only if it is at least this much faster
+MINE_CLEAR = 45                # a path passes this far beyond a mine's trigger radius
+
+
+def enemy_reach(w, uid):
+    """The target's firing range: an alien's (npc_range, with the panel's multiplier), a bot's lasers, the player's lasers; None if gone."""
+    m = w.npcs.get(uid)
+    if m is not None:
+        return LASER_RANGE if m.bot is not None else w.npc_range(m)
+    o = _player(w, uid)
+    return o.laser_range() if o is not None else None
+
+
+def _track(w, uid, now):
+    """(mover, speed) of the target: its movement is known up to its end point (world.Mover), so where it will be is known."""
+    m = w.npcs.get(uid)
+    if m is not None:
+        return m.mover, m.speed() * m.effect.speed_factor(now)
+    o = _player(w, uid)
+    return (o.hero, o.p.d['ship'].get('speed', 300)) if o is not None else (None, 0)
+
+
+def weapon_reach(w, n, now):
+    """How far the weapon it fires next reaches. Only lasers today (fire: LASER_RANGE; rockets and the launcher reach farther and fire
+    with them). A shorter-range weapon (a particle cannon, if bots get one) would return its range while it is ready, so that the bot
+    closes in for the shot and falls back to the lasers' distance after it (combat_band)."""
+    return LASER_RANGE
+
+
+def _smb_ready(w, uid, now):
+    """The enemy has a Smart Bomb and could fire it now (a pilot who watches the enemy counts its cooldown)."""
+    from . import active_items as AC, extras as EX
+    m = w.npcs.get(uid)
+    if m is not None:
+        return m.bot is not None and bool(EX.var(m.bot, EX.SMB)) and AC.ready(m, 'smb', now)
+    o = _player(w, uid)
+    if o is None:
+        return False
+    import combat_items as CI
+    return bool(CI.EX.has(o.p, 'smart_bomb')) and o.items.ready(CI.S['smart_bomb']['cooldown_group'], now)
+
+
+def _pvp(w, uid):
+    return uid not in w.npcs or w.npcs[uid].bot is not None
+
+
+def combat_band(w, n, now):
+    """(lo, goal, hi, kite): the distance the bot keeps from its target, and whether it circles it to stay there.
+    Against an alien: outside the alien's range and inside its own (the safe band), if the pilot knows that alien's range (the more
+    combat skill, the likelier; decided once per fight); otherwise its habit (playstyle range), as before. The skill also sets how
+    finely it cuts the margin and how well it leads the alien (approach). No safe band when the
+    alien outranges it (The Stinger 800, fixed turrets) or is about as fast (it cannot be kept at bay): it fights from its habit.
+    Against a player or a bot: it sticks to its target so as not to lose it; a sharp pilot who is not slower stays outside the radius of
+    an enemy Smart Bomb that is ready (the bomb's 600 is inside the lasers' 700). Before, every fight was at the habit distance, whatever
+    the alien's range, and the bot moved again only beyond it + 120."""
+    b = n.bot
+    habit = (280 + 300 * (1 - b.o('aggression'))) * PL.profile(b)['range']
+    reach = weapon_reach(w, n, now)
+    t = n.target
+    _, speed = _track(w, t, now)
+    if _pvp(w, t):
+        sk = PL.skill(b, 'pvp')
+        if sk > 0.5 and n.speed() >= speed and _smb_ready(w, t, now):
+            from . import active_items as AC
+            r = AC.CIT['smart_bomb']['radius']
+            if r + 60 < reach:
+                return r + 15, (r + reach) / 2, reach - 15, True
+        goal = STICK[1] - (STICK[1] - STICK[0]) * (0.5 * b.o('aggression') + 0.5 * sk)
+        return 60, goal, goal + 150, False
+    sk = PL.skill(b, 'combat')
+    er = enemy_reach(w, t) or 0
+    lo_s = er + _margin(sk)
+    hi_s = reach - 20 - 40 * (1 - sk)
+    if lo_s >= hi_s or (speed > 0 and n.speed() < speed * KITE_SPEED):
+        return 120, min(habit, reach - 60), min(habit + 120, reach - 20), False
+    knows = n.__dict__.get('knows')
+    if knows is None or knows[0] != t:                   # does it know this alien's range: decided once per fight (never as a novice,
+        knows = n.knows = (t, random.random() < (sk - 0.15) / 0.45)      # always from 0.6: practice)
+    if not knows[1]:
+        return 120, min(habit, reach - 60), min(habit + 120, reach - 20), False
+    goal = max(lo_s, min(hi_s, (lo_s + hi_s) / 2))
+    return lo_s, goal, hi_s, True
+
+
+def _mines(w, now):
+    """Armed player mines on the map (about to be armed too): they go off under any ship, bots included (combat_items.mine_tick)."""
+    out = []
+    for o in w.items.mine_worlds():
+        for m in o.items.mines.values():
+            if m['owner'] == o.hid and now >= m['armed_at'] - 1 and m['end_time'] > now:
+                out.append((m['x'], m['y']))
+    return out
+
+
+def _clear(ax, ay, bx, by, mines, r):
+    """The straight path a-b passes no mine closer than r."""
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    for mx, my in mines:
+        f = 0.0 if l2 == 0 else max(0.0, min(1.0, ((mx - ax) * dx + (my - ay) * dy) / l2))
+        if math.hypot(ax + f * dx - mx, ay + f * dy - my) < r:
+            return False
+    return True
+
+
+def _steer(w, n, cx, cy, radius, a, now, turn=1, threshold=40):
+    """Goes to the point at angle a and this distance from (cx, cy). On a map edge the circling turns back (the point would be pushed
+    off the circle). If the path crosses a mine, the nearest angle that is clear, first on its way round (a pilot sees the mines if
+    it watches for them: survival skill)."""
+    def point(a):
+        return cx + math.cos(a) * radius, cy + math.sin(a) * radius
+
+    x, y = point(a)
+    if turn and (min(x, y) < 160 or x > w.map_w - 160 or y > w.map_h - 160):
+        n.orbit_direction = -n.__dict__.get('orbit_direction', 1)
+        a -= 2 * turn * n.__dict__.get('step', 0.4) * -n.orbit_direction
+        x, y = point(a)
+    mines = _mines(w, now) if random.random() < 0.35 + 0.65 * PL.skill(n.bot, 'survival') else ()
+    if mines:
+        import combat_items as CI
+        r = CI.S['mine']['trigger'] + MINE_CLEAR
+        nx, ny = n.mover.pos(now)
+        d = n.__dict__.get('orbit_direction', 1)
+        for k in (0, 1, -1, 2, -2, 3, -3, 4, -4):
+            px, py = point(a + d * k * 0.3)
+            if _clear(nx, ny, px, py, mines, r):
+                x, y = px, py
+                break
+    _go_to(w, n, x, y, now, threshold=threshold)
+
+
 def approach(w, n, pos, now):
-    """Combat distance to the target: within laser range, close or far depending on personality; circles lightly around the target."""
+    """Combat movement: keeps the distance of combat_band from its target. A sharp pilot aims where the target will be (its movement is
+    known: _track), a novice where it is. Circling (kite): one chord of the circle around where the target will be at a time, so it stays
+    in the band while the alien chases it; between thoughts keep_range keeps it going. Not circling: as before, back to its distance when
+    it leaves the band, and now and then a small circle step."""
+    b = n.bot
+    lo, goal, hi, kite = combat_band(w, n, now)
+    sk = PL.skill(b, 'pvp' if _pvp(w, n.target) else 'combat')
+    n.approaching = (n.target, now)
     nx, ny = n.mover.pos(now)
-    dist = math.hypot(pos[0] - nx, pos[1] - ny)
-    pl = PL.profile(n.bot)
-    wanted = (280 + 300 * (1 - n.bot.o('aggression'))) * pl['range']         # its own preferred distance (playstyle.py)
-    pvp = n.target in w.npcs and w.npcs[n.target].bot is not None or n.target not in w.npcs
-    sk = PL.skill(n.bot, 'pvp' if pvp else 'combat')
-    if dist > wanted + 120 or dist < 120:
-        a = math.atan2(ny - pos[1], nx - pos[0]) + random.uniform(-0.5, 0.5)
-        _go_to(w, n, pos[0] + math.cos(a) * wanted, pos[1] + math.sin(a) * wanted, now)
-    elif n.mover.t1 <= now and random.random() < (0.12 + 0.6 * pl['orbit']) * (0.55 + 0.9 * sk):     # skilled pilots keep moving
-        # in range: circles around the target (a real player fires while circling, not standing still); the direction is fixed by the bot's temperament
-        direction = n.__dict__.setdefault('orbit_direction', random.choice((-1, 1)))
-        a = math.atan2(ny - pos[1], nx - pos[0]) + direction * random.uniform(0.25, 0.6)
-        _go_to(w, n, pos[0] + math.cos(a) * wanted, pos[1] + math.sin(a) * wanted, now, threshold=40)
+    cur = math.hypot(pos[0] - nx, pos[1] - ny)
+    seg = 0.5 + 0.7 * (1 - sk)                          # one move (s): a sharp pilot corrects more often
+    mover, speed = _track(w, n.target, now)
+    lead = seg * min(1.0, 1.3 * sk) if sk > 0.25 else 0.0
+    tx, ty = pos
+    m = w.npcs.get(n.target)
+    if lead and m is not None and m.bot is None and m.bot_target == n.id and cur > 1:
+        tx, ty = pos[0] + (nx - pos[0]) / cur * speed * lead, pos[1] + (ny - pos[1]) / cur * speed * lead     # it chases: comes at it
+    elif lead and mover is not None:
+        tx, ty = mover.pos(now + lead)                   # otherwise along its known movement
+    a = math.atan2(ny - ty, nx - tx)
+    d = n.__dict__.setdefault('orbit_direction', random.choice((-1, 1)))
+    orbit = PL.profile(b)['orbit']
+    if not kite:
+        if cur > hi or cur < lo:
+            _steer(w, n, tx, ty, goal, a + random.uniform(-0.5, 0.5) * (1 - 0.6 * sk), now, turn=0, threshold=40)
+        elif n.mover.t1 <= now and random.random() < (0.12 + 0.6 * orbit) * (0.55 + 0.9 * sk):     # skilled pilots keep moving
+            _steer(w, n, tx, ty, goal, a + d * random.uniform(0.25, 0.6), now, threshold=40)
+        return
+    threats = _threats(w, n, now) if random.random() < (sk - 0.4) / 0.3 else []      # watches the others after it too (skill)
+    if lo <= cur <= hi and n.mover.t1 > now + 0.15 and not _exposed(n, threats, now, sk):
+        return                                           # on its way along the circle, in the band
+    n.step = 2 * math.asin(min(0.9, n.speed() * seg / (2 * goal)))
+    if len(threats) > 1:
+        return _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk)
+    _steer(w, n, tx, ty, goal, a + d * n.step, now, threshold=25)
+
+
+def _threats(w, n, now, reach=1500):
+    """The aliens after the bot (npc_to_bot) near it: [(x, y, range, speed)]."""
+    nx, ny = n.mover.pos(now)
+    out = []
+    for m in w.npcs.values():
+        if m.bot is None and m.alive and m.bot_target == n.id and m.d['damage'] > 0:
+            x, y = m.mover.pos(now)
+            if math.hypot(x - nx, y - ny) < reach:
+                out.append((x, y, w.npc_range(m), m.speed() * m.effect.speed_factor(now)))
+    return out
+
+
+def _margin(sk):
+    return SAFE_MARGIN[1] - (SAFE_MARGIN[1] - SAFE_MARGIN[0]) * sk
+
+
+def _exposed(n, threats, now, sk):
+    """One of the aliens after it is (nearly) within its range of the bot."""
+    nx, ny = n.mover.pos(now)
+    return any(math.hypot(x - nx, y - ny) < r + 0.5 * _margin(sk) for x, y, r, v in threats)
+
+
+def _dodge(w, n, threats, tx, ty, goal, a, seg, lead, now, sk):
+    """Several aliens after it: of the points it could reach in one move (on its circle round the target, a little wider, or straight
+    away from the pack), the one that leaves it least in their ranges where they will be (they come at it), while it can still shoot
+    its target. Running straight away makes the chasers bunch up behind it (they all come at it from the same side); once bunched,
+    the circle round the target is clear of them all again and it circles the pack."""
+    nx, ny = n.mover.pos(now)
+    v = n.speed()
+    margin = _margin(sk)
+    reach = weapon_reach(w, n, now) - 15
+    d = n.__dict__.get('orbit_direction', 1)
+    future = [(x + (nx - x) / max(1.0, math.hypot(nx - x, ny - y)) * s * lead,
+               y + (ny - y) / max(1.0, math.hypot(nx - x, ny - y)) * s * lead, r) for x, y, r, s in threats]
+    cx, cy = sum(f[0] for f in future) / len(future), sum(f[1] for f in future) / len(future)
+    away = math.atan2(ny - cy, nx - cx)
+    cands = [(tx + math.cos(a + d * k * n.step) * rr, ty + math.sin(a + d * k * n.step) * rr, k < 0)
+             for k in (-2, -1, 1, 2, 3) for rr in (goal, goal + 70)]
+    cands += [(nx + math.cos(away + e) * v * seg, ny + math.sin(away + e) * v * seg, False) for e in (-0.6, -0.3, 0.0, 0.3, 0.6)]
+    ring = max(math.hypot(fx - cx, fy - cy) + r for fx, fy, r in future) + margin     # round the pack, out of reach of all of them
+    da = 2 * math.asin(min(0.9, v * seg / (2 * ring)))
+    cands += [(cx + math.cos(away + d * k * da) * ring, cy + math.sin(away + d * k * da) * ring, k < 0) for k in (-1, 1, 2)]
+    mines = _mines(w, now) if random.random() < 0.35 + 0.65 * PL.skill(n.bot, 'survival') else ()
+    if mines:
+        import combat_items as CI
+        rm = CI.S['mine']['trigger'] + MINE_CLEAR
+    best = None
+    for px, py, back in cands:
+        px, py = max(200, min(w.map_w - 200, px)), max(200, min(w.map_h - 200, py))      # where _go_to really sends it
+        cost = 0.0
+        for fx, fy, r in future:
+            for qx, qy in ((px, py), ((px + nx) / 2, (py + ny) / 2)):     # where it ends and halfway there
+                cost += max(0.0, r + margin - math.hypot(qx - fx, qy - fy))
+        cost += 0.5 * max(0.0, math.hypot(px - tx, py - ty) - reach)     # out of its own range: no damage done
+        cost += 0.25 * max(0.0, 1200 - min(px, py, w.map_w - px, w.map_h - py))      # towards an edge or a corner it cannot get out of
+        if back:
+            cost += 15                                   # turning back on its circle
+        if mines and not _clear(nx, ny, px, py, mines, rm):
+            cost += 300
+        if best is None or cost < best[0]:
+            best = (cost, px, py, back)
+    if best[3]:
+        n.orbit_direction = -d
+    _go_to(w, n, best[1], best[2], now, threshold=25)
+
+
+def keep_range(w, n, now):
+    """Between two thoughts, while it fights a target it approached: once its move ends or it leaves the band, the next move (approach).
+    How soon it reacts: its reaction time, shorter for a sharp pilot."""
+    t = n.target
+    last = n.__dict__.get('approaching')
+    if t is None or last is None or last[0] != t or now - last[1] > 3:
+        return
+    sk = PL.skill(n.bot, 'pvp' if _pvp(w, t) else 'combat')
+    n.next_move = now + n.bot.k['personality']['reaction_sec'] * (0.25 + 0.5 * (1 - sk))
+    if random.random() < 0.08 * (1 - PL.skill(n.bot, 'focus')) * (1.2 - sk):
+        n.next_move += random.uniform(1.0, 3.0)          # a lapse: looks at the minimap, the chat, the loot (focus)
+    pos = _position(w, t, now)
+    if pos is None:
+        return
+    if n.mover.t1 <= now + 0.1:
+        return approach(w, n, pos, now)
+    lo, _, hi, kite = combat_band(w, n, now)
+    nx, ny = n.mover.pos(now)
+    if not lo <= math.hypot(pos[0] - nx, pos[1] - ny) <= hi or (kite and sk > 0.4 and _exposed(n, _threats(w, n, now), now, sk)):
+        approach(w, n, pos, now)
 
 
 def pvp_target(w, n, now):
