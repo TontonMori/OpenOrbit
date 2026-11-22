@@ -6,7 +6,8 @@ as the bot's save (persistent).
 
 All of the game's "other player" lookups go through community.all_(): once the bots register there with a fake session (BotSession), the
 directory, clan, group, whisper, mail, ranking and auction see them on their own. The bot's decisions are in tick() (the manager's thread):
-  group invite       accept / decline (sociability, relationship, level gap, current job), in the group follows the leader (goals/group.py)
+  group invite       accept / decline (grouping is the norm: clan, the inviter's standing, company, current job), in the group follows the
+                     leader (goals/group.py); bots look for a group with the same aim and invite players too (party, bot_invite_gap)
   friendship         accepts / declines an incoming request; sends a request to someone it played with or helped
   clan               a leader-minded, rich bot founds a clan; other bots apply to a clan that fits their personality; a bot leader
                      evaluates applications (the player's too); a bot with little loyalty may leave over time
@@ -254,6 +255,11 @@ def invites(y, b, now):
             continue
         k = person(b)
         if decide_group(y, b, name, uid, now):
+            g = GR.group_of(b.uid)
+            if g is not None and _human(uid) and not any(_human(u) for u in g.members):
+                GR.handle(k, 'LeaveGroupRequest', {})        # a player's invitation beats a bot-only hunting party (decide_group weighed it)
+                b.party_until = None
+                b.event('left_group', now)
             GR.handle(k, 'InvitationAcceptRequest', {'inviterId': uid})
             b.memory.event(name, 'group', now)
             b.event('joined_group', now, name=name)
@@ -278,68 +284,146 @@ def _group_up(y, b, now):
 
 
 PARTY_MIN = (20 * 60, 100 * 60)          # how long a bot-only group hunts together before someone leaves
+PARTY_SIZE = (2, 5)                      # a bot leader fills its bot-only party up to this many (random per party)
+PAIR_GAP = 3 * 3600                      # a bot does not invite the same player again for this long (a refusal or an ignored invite)
+BUSY = ('gate', 'mode', 'pvp_match', 'duel')      # jobs a pilot does not drop for a group
+HUMAN_INVITE = {}                        # player uid -> last bot invitation sent to them (bot_invite_gap)
+
+
+def _human(uid):
+    return uid < 1800000000 or uid >= 1900000000         # bot uids are 18xxxxxxxx (state.py)
+
+
+def _war_map(m):
+    """4-X and 5-X: the companies meet there; grouping across companies is not absurd there (rare elsewhere)."""
+    import map_links as H
+    return str(H.name(int(m or 0))).startswith(('4-', '5-'))
+
+
+def _clan_id(k):
+    import clan as KL
+    c = KL.clan_of(k.profile) if k is not None and k.profile is not None else None
+    return c['id'] if c else None
+
+
+def _map_of(k):
+    return int(k.profile.d['position'].get('mapId', 0) or 0) if k is not None and k.profile is not None else 0
+
+
+def _standing(k):
+    """(level, rank 1-21) of a pilot as the others see it: who is worth grouping with."""
+    pilot = k.profile.d['pilot']
+    return int(pilot.get('level', 1) or 1), max(1, min(21, int(pilot.get('dailyRank', 1) or 1)))
 
 
 def party(y, b, now):
-    """Bots group up among themselves like real players: a pilot that likes playing with others invites an online friend or
-    acquaintance of its company (similar level) to hunt together; the invited one decides like for any invitation (decide_group).
-    A bot-only group breaks up after a while (someone leaves: dinner, other plans). Before, bots grouped only with the human player."""
+    """Bots look for a group like real players: grouping shares the rewards and the quest kills, so it is the norm. A free pilot (or the
+    leader of a bot-only party with room) invites someone with the same aim: on its map, of its clan, of its level, doing the same job;
+    a strong player is sought after (a top player gets invitations). Another company only on 4-X / 5-X and rarely. The invited one decides
+    with decide_group. A bot-only party breaks up after a while. Invitations to a player: at most one every bot_invite_gap seconds per
+    player (0: none), never twice from the same bot within PAIR_GAP. Before, only a friend or acquaintance of the same company was
+    invited, about once in four hours per bot, and never a player (player request 2026-11-22)."""
     import group as GR
     import community as TP
     from . import playstyle as PL
     g = GR.group_of(b.uid)
     if g is not None:
-        humans = [u for u in g.members if u < 1800000000 or u >= 1900000000]
+        humans = [u for u in g.members if _human(u)]
         until = b.__dict__.get('party_until')
         if not humans and until is not None and now > until:
             GR.handle(person(b), 'LeaveGroupRequest', {})
             b.party_until = None
-            b.party_cd = now + b.r.uniform(3600, 4 * 3600)     # does not form a new group right away
+            b.party_cd = now + b.r.uniform(1800, 2 * 3600)     # does not form a new group right away
             b.event('left_group', now)
-        return
+            return
+        size = b.__dict__.setdefault('party_size', b.r.randint(*PARTY_SIZE))
+        if humans or g.leader != b.uid or len(g.members) >= size or len(g.members) >= GR.MAX_COUNT:
+            return                                       # only the leader of a bot-only party with room keeps recruiting
     if now < b.__dict__.get('party_cd', 0):
         return
-    if b.target is None or b.target.name not in ('grinding', 'quest', 'resting', 'exploring'):
+    if b.target is None or b.target.name not in ('grinding', 'quest', 'resting', 'exploring', 'pvp', 'group'):
         return
-    if b.r.random() > 0.004 * b.o('sociability') * PL.like(b, 'social') ** 2:
+    if b.r.random() > 0.06 * (0.4 + b.o('sociability')) * min(1.5, PL.like(b, 'social')) * (0.3 if PL.has(b, 'lone_wolf') else 1.0):
         return
+    my_clan, my_map, my_rank = b.k.get('clan'), int(b.game_map or 0), rank(b)
+    gap = y.setting('bot_invite_gap', 90)
+    asked = b.__dict__.setdefault('asked', {})
     cands = []
-    for o in y.bots:
-        if o is b or not o.online or o.company != b.company or o.dead_until > now or abs(o.level - b.level) > 6:
+    for k in TP.all_().values():                         # players: those near, clanmates and friends anywhere
+        if not _human(k.uid) or k.session is None or k.profile is None or GR.group_of(k.uid) is not None:
             continue
-        rel = b.memory.relation(o.name, now)
-        friend = o.name in (b.k.get('friends') or [])
-        if (rel > 0.12 or friend) and GR.group_of(o.uid) is None:
-            cands.append((rel + 0.4 * friend + 0.1 * (o.game_map == b.game_map), o))
+        if not gap or now - HUMAN_INVITE.get(k.uid, 0) < gap or now - asked.get(k.uid, 0) < PAIR_GAP:
+            continue
+        same_map, clan = _map_of(k) == my_map, my_clan is not None and _clan_id(k) == my_clan
+        friend = k.name in (b.k.get('friends') or [])
+        if not (same_map or clan or friend):
+            continue
+        company = int(k.profile.d['pilot'].get('factionId', 0) or 0)
+        if company != b.company and not (same_map and _war_map(my_map) and b.r.random() < 0.15):
+            continue
+        lv, rk = _standing(k)
+        score = (0.5 * same_map + 0.7 * clan + 0.4 * friend + b.memory.relation(k.name, now)
+                 + 0.06 * max(0, lv - b.level) + 0.03 * max(0, rk - my_rank) - 0.04 * max(0, b.level - lv - 5))
+        cands.append((score, k.uid, k.name, None))
+    for o in y.bots:                                     # bots: the same aim
+        if o is b or not o.online or o.dead_until > now or GR.group_of(o.uid) is not None:
+            continue
+        same_map, clan = o.game_map == b.game_map, my_clan is not None and o.k.get('clan') == my_clan
+        if o.company != b.company and not (same_map and _war_map(my_map) and b.r.random() < 0.1):
+            continue
+        if abs(o.level - b.level) > (10 if clan else 6) or not (same_map or clan or o.name in (b.k.get('friends') or [])):
+            continue
+        same_job = o.target is not None and b.target is not None and o.target.name == b.target.name
+        score = (0.5 * same_map + 0.6 * clan + 0.3 * same_job + b.memory.relation(o.name, now)
+                 + 0.4 * (o.name in (b.k.get('friends') or [])) - 0.04 * abs(o.level - b.level) - 0.5 * (o.company != b.company))
+        cands.append((score, o.uid, o.name, o))
     if not cands:
         return
-    o = max(cands, key=lambda x: x[0] + b.r.uniform(0, 0.3))[1]
-    if TP.find(uid=o.uid) is None:
+    score, uid, name, o = max(cands, key=lambda x: x[0] + b.r.uniform(0, 0.3))
+    if TP.find(uid=uid) is None:
         return
-    GR.handle(person(b), 'GroupInvitationRequest', {'candidateId': o.uid})
-    b.party_until = now + b.r.uniform(*PARTY_MIN)
-    o.party_until = b.party_until + b.r.uniform(-600, 600)
-    b.event('group_invite', now, name=o.name)
+    GR.handle(person(b), 'GroupInvitationRequest', {'candidateId': uid})
+    if o is None:
+        HUMAN_INVITE[uid] = asked[uid] = now
+    if g is None:
+        b.party_until = now + b.r.uniform(*PARTY_MIN)
+        b.party_size = b.r.randint(*PARTY_SIZE)
+    if o is not None:
+        o.party_until = (b.__dict__.get('party_until') or now + PARTY_MIN[0]) + b.r.uniform(-600, 600)
+    b.event('group_invite', now, name=name)
 
 
 def decide_group(y, b, name, uid, now):
-    """Does it accept the group invitation: sociability, relationship with the inviter, level gap, current job (less in the middle of a
-    quest), fatigue, company (rarely an invite from another company). If it said "inv me" in chat (promise) it accepts."""
+    """Does it accept the group invitation. Grouping is the norm (shared rewards and quest kills): most pilots accept, a clanmate almost
+    always; a stronger, higher-ranked inviter is sought after, a much weaker one is carried less gladly; another company only on 4-X / 5-X
+    and rarely; a lone wolf, fatigue or a job it would not drop (gate, mode, duel) lower it. Already in a bot-only party: a player's
+    invitation can still win (invites leaves the party). If it said "inv me" in chat (promise) it accepts. Before, about half accepted,
+    a clanmate had no bonus and every level of gap counted against the inviter, so the strongest player was refused most."""
     from . import interaction as IX
     if IX.has_promise(b, 'group', name, now):
         return True
     import community as TP
-    o = TP.find(uid=uid)
-    lv = int(o.profile.d['pilot'].get('level', 1)) if o is not None else b.level
-    diff = abs(lv - b.level)
-    p = 0.25 + 0.5 * b.o('sociability') + 0.6 * b.memory.relation(name, now) - 0.04 * max(0, diff - 3) - 0.3 * b.mood['fatigue']
+    import group as GR
     from . import playstyle as PL
-    p *= min(1.4, PL.like(b, 'social') ** 0.7)             # a lone wolf rarely groups (playstyle.py)
-    if b.target is not None and b.target.name == 'quest':
-        p -= 0.15
-    if o is not None and int(o.profile.d['pilot'].get('factionId', 0)) != b.company:
-        p -= 0.5
-    return b.r.random() < max(0.03, min(0.95, p))
+    o = TP.find(uid=uid)
+    p = 0.72 + 0.2 * b.o('sociability') + 0.4 * b.memory.relation(name, now) - 0.25 * b.mood['fatigue']
+    p *= min(1.15, PL.like(b, 'social') ** 0.5) * (0.6 if PL.has(b, 'lone_wolf') else 1.0)      # a lone wolf rarely groups (playstyle.py)
+    if b.target is not None and b.target.name in BUSY:
+        p -= 0.35
+    elif b.target is not None and b.target.name == 'quest':
+        p -= 0.05                                        # quest kills are shared in a group: hardly a reason to refuse
+    if o is not None and o.profile is not None:
+        lv, rk = _standing(o)
+        p += min(0.15, 0.02 * max(0, lv - b.level) + 0.01 * max(0, rk - rank(b)))
+        p -= 0.03 * max(0, b.level - lv - 5)
+        if b.k.get('clan') is not None and _clan_id(o) == b.k.get('clan'):
+            p += 0.3
+        if int(o.profile.d['pilot'].get('factionId', 0) or 0) != b.company:
+            p -= 0.5 if _war_map(_map_of(o)) else 0.8     # not the norm on 4-X / 5-X, rare elsewhere
+    g = GR.group_of(b.uid)
+    if g is not None and _human(uid) and not any(_human(u) for u in g.members):
+        p -= 0.15                                        # leaves its bot party for him: a little less likely
+    return b.r.random() < max(0.03, min(0.98, p))
 
 
 def friendship(y, b, now):

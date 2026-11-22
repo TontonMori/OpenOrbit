@@ -502,6 +502,8 @@ function btBehavior(d) {
       btNumber(a.max_concrete, v => btSetting('max_concrete', v), { min: 1, max: 150 })),
     btRow(T('One bot clan for every how many bots'), T('Number of clans the bots can found, relative to the roster.'), btNumber(a.bots_per_clan, v => btSetting('bots_per_clan', v), { min: 3, max: 100 })),
     btRow(T('Most to answer a call for help'), T('Maximum number of bots that answer a call for help in chat.'), btNumber(a.help_max, v => btSetting('help_max', v), { min: 0, max: 20 })),
+    btRow(T('Seconds between group invitations'), T('Bots invite you to their group like real players (more often the stronger you are). At most one invitation every this many seconds; 0: bots never invite you.'),
+      btNumber(a.bot_invite_gap, v => btSetting('bot_invite_gap', v), { min: 0, max: 3600 })),
     h('h3', null, T('Prime time')),
     btRow(T('Start and end hour'), T("The busy evening hours (your computer's clock): more bots are online and PvP heats up. If start equals end there is no prime time."),
       h('div', { class: 'row', style: { gap: '6px' } }, btNumber(a.prime_start, v => btSetting('prime_start', v), { min: 0, max: 23 }), h('span', null, '–'),

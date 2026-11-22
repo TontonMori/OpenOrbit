@@ -36,6 +36,7 @@ SETTINGS = {
     'foreign_map': ('bool', None, None, True),
     'chat_min': ('full', 0, 60, 6),
     'help_max': ('full', 0, 20, 3),
+    'bot_invite_gap': ('full', 0, 3600, 90),           # seconds between two bot group invitations to a player (0: never; bot/society.party)
     'max_concrete': ('full', 1, 150, 40),
     'bots_per_clan': ('full', 3, 100, 12),
     'rude_chat': ('full', 0, 3, 1),
