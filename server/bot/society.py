@@ -288,16 +288,19 @@ PARTY_SIZE = (2, 5)                      # a bot leader fills its bot-only party
 PAIR_GAP = 3 * 3600                      # a bot does not invite the same player again for this long (a refusal or an ignored invite)
 BUSY = ('gate', 'mode', 'pvp_match', 'duel')      # jobs a pilot does not drop for a group
 HUMAN_INVITE = {}                        # player uid -> last bot invitation sent to them (bot_invite_gap)
+ALLIANCE, NAP, WAR = 1, 2, 3             # clan.clan_relation
 
 
 def _human(uid):
     return uid < 1800000000 or uid >= 1900000000         # bot uids are 18xxxxxxxx (state.py)
 
 
-def _war_map(m):
-    """4-X and 5-X: the companies meet there; grouping across companies is not absurd there (rare elsewhere)."""
+def _zone(m):
+    """What a map means for grouping across companies: 'coop' 4-5 and 5-X (the Uber and pirate aliens are too strong at first: better
+    to group with the enemy than to die), 'battle' 4-1..4-4 (the PvP maps: only allied clans), 'company' the others."""
     import map_links as H
-    return str(H.name(int(m or 0))).startswith(('4-', '5-'))
+    name = str(H.name(int(m or 0)))
+    return 'coop' if name == '4-5' or name.startswith('5-') else 'battle' if name.startswith('4-') else 'company'
 
 
 def _clan_id(k):
@@ -310,19 +313,82 @@ def _map_of(k):
     return int(k.profile.d['position'].get('mapId', 0) or 0) if k is not None and k.profile is not None else 0
 
 
-def _standing(k):
-    """(level, rank 1-21) of a pilot as the others see it: who is worth grouping with."""
-    pilot = k.profile.d['pilot']
-    return int(pilot.get('level', 1) or 1), max(1, min(21, int(pilot.get('dailyRank', 1) or 1)))
+def _bot_of(y, uid):
+    return next((o for o in y.bots if o.uid == uid), None)
+
+
+def _power_of(y, k):
+    """A pilot's combat power as the others judge it (catalog.power_score): a bot's equipment, a player's ship in the game; None if
+    unknown (a player not in a map)."""
+    o = _bot_of(y, k.uid) if k is not None and not _human(k.uid) else None
+    if o is not None:
+        return o.value()['power']
+    w = getattr(k, 'world', None) if k is not None else None
+    if w is not None:
+        from . import ship as G
+        return G.hero_power(w)
+    return None
+
+
+def _standing(b, power):
+    """How much the bot gains (> 0) or loses (< 0) by grouping with a pilot of this power: a stronger one speeds its progress, a much
+    weaker one slows it, less so for a helpful pilot who likes carrying newcomers (trait helpfulness)."""
+    import math
+    mine = max(1.0, b.value()['power'])
+    if not power:
+        return 0.0
+    r = math.log2(max(0.05, power / mine))
+    if r >= 0:
+        return min(0.15, 0.1 * r)
+    return max(-0.4, 0.2 * r * (1.25 - b.o('helpfulness')))     # helpfulness 1: a quarter of the penalty
+
+
+def _appeal(b, power):
+    """How much the bot wants to invite a pilot of this power (party's choice): a stronger one is sought after, the more the stronger
+    (a top player gets invitations), a weaker one only by a helpful pilot."""
+    import math
+    if not power:
+        return 0.0
+    r = max(-2.0, min(2.0, math.log2(max(0.05, power / max(1.0, b.value()['power'])))))
+    return 0.35 * r if r >= 0 else 0.3 * r * (1.25 - b.o('helpfulness'))
+
+
+def _openness(b):
+    """Willingness to cooperate with another company (0-1): low for an aggressive, competitive pilot (who shoots on sight instead)."""
+    return max(0.0, min(1.0, 1.2 - 0.6 * b.o('aggression') - 0.6 * b.o('rivalry')))
+
+
+def _diplo(b, company, clan, m):
+    """The diplomatic part of grouping with a pilot of this company and clan on map m (decide_group's terms): same clan > allied clan >
+    same company; another company: possible on 'coop' maps, almost never on the PvP maps unless the clans are allied, rare elsewhere;
+    clans at war: no."""
+    import clan as KL
+    mine = b.k.get('clan')
+    if mine is not None and clan == mine:
+        return 0.3
+    rel = KL.clan_relation(mine, clan) if mine is not None and clan is not None else 0
+    if rel == WAR:
+        return -1.5
+    if company == b.company:
+        return 0.15 if rel == ALLIANCE else 0.0
+    z = _zone(m)
+    if rel == ALLIANCE:
+        return -0.1 if z != 'company' else -0.3
+    if z == 'coop':
+        return -0.3 - 0.4 * (1 - _openness(b))
+    if z == 'battle':
+        return -1.5
+    return -0.75 - 0.2 * (1 - _openness(b))
 
 
 def party(y, b, now):
     """Bots look for a group like real players: grouping shares the rewards and the quest kills, so it is the norm. A free pilot (or the
-    leader of a bot-only party with room) invites someone with the same aim: on its map, of its clan, of its level, doing the same job;
-    a strong player is sought after (a top player gets invitations). Another company only on 4-X / 5-X and rarely. The invited one decides
-    with decide_group. A bot-only party breaks up after a while. Invitations to a player: at most one every bot_invite_gap seconds per
-    player (0: none), never twice from the same bot within PAIR_GAP. Before, only a friend or acquaintance of the same company was
-    invited, about once in four hours per bot, and never a player (player request 2026-11-22)."""
+    leader of a bot-only party with room) invites someone with the same aim (same map, same job), friendly (company, clan, alliance,
+    friends) and as strong or stronger (standing; a helpful pilot also takes weaker ones): players near it, in its clan or friends too, a
+    strong player more often. Another company only where diplomacy allows (4-5 and 5-X; allied clans). The invited one decides with
+    decide_group. A bot-only party breaks up after a while. Invitations to a player: at most one every bot_invite_gap seconds per player
+    (0: none), never twice from the same bot within PAIR_GAP. Before, only a friend or acquaintance of the same company was invited,
+    about once in four hours per bot, and never a player (player request 2026-11-22)."""
     import group as GR
     import community as TP
     from . import playstyle as PL
@@ -345,7 +411,8 @@ def party(y, b, now):
         return
     if b.r.random() > 0.06 * (0.4 + b.o('sociability')) * min(1.5, PL.like(b, 'social')) * (0.3 if PL.has(b, 'lone_wolf') else 1.0):
         return
-    my_clan, my_map, my_rank = b.k.get('clan'), int(b.game_map or 0), rank(b)
+    my_map = int(b.game_map or 0)
+    friends = set(b.k.get('friends') or [])
     gap = y.setting('bot_invite_gap', 90)
     asked = b.__dict__.setdefault('asked', {})
     cands = []
@@ -354,28 +421,25 @@ def party(y, b, now):
             continue
         if not gap or now - HUMAN_INVITE.get(k.uid, 0) < gap or now - asked.get(k.uid, 0) < PAIR_GAP:
             continue
-        same_map, clan = _map_of(k) == my_map, my_clan is not None and _clan_id(k) == my_clan
-        friend = k.name in (b.k.get('friends') or [])
-        if not (same_map or clan or friend):
+        same_map, clan, friend = _map_of(k) == my_map, _clan_id(k), k.name in friends
+        if not (same_map or friend or (clan is not None and clan == b.k.get('clan'))):
             continue
-        company = int(k.profile.d['pilot'].get('factionId', 0) or 0)
-        if company != b.company and not (same_map and _war_map(my_map) and b.r.random() < 0.15):
+        d = _diplo(b, int(k.profile.d['pilot'].get('factionId', 0) or 0), clan, my_map)
+        if d <= -1.0:
             continue
-        lv, rk = _standing(k)
-        score = (0.5 * same_map + 0.7 * clan + 0.4 * friend + b.memory.relation(k.name, now)
-                 + 0.06 * max(0, lv - b.level) + 0.03 * max(0, rk - my_rank) - 0.04 * max(0, b.level - lv - 5))
+        score = 0.5 * same_map + 0.4 * friend + d + _appeal(b, _power_of(y, k)) + b.memory.relation(k.name, now)
         cands.append((score, k.uid, k.name, None))
     for o in y.bots:                                     # bots: the same aim
         if o is b or not o.online or o.dead_until > now or GR.group_of(o.uid) is not None:
             continue
-        same_map, clan = o.game_map == b.game_map, my_clan is not None and o.k.get('clan') == my_clan
-        if o.company != b.company and not (same_map and _war_map(my_map) and b.r.random() < 0.1):
+        same_map, clan, friend = o.game_map == b.game_map, o.k.get('clan'), o.name in friends
+        if not (same_map or friend or (clan is not None and clan == b.k.get('clan'))):
             continue
-        if abs(o.level - b.level) > (10 if clan else 6) or not (same_map or clan or o.name in (b.k.get('friends') or [])):
+        d = _diplo(b, o.company, clan, my_map)
+        if d <= -1.0 or (d < -0.2 and b.r.random() > 0.3):    # across companies a pilot rarely asks first
             continue
         same_job = o.target is not None and b.target is not None and o.target.name == b.target.name
-        score = (0.5 * same_map + 0.6 * clan + 0.3 * same_job + b.memory.relation(o.name, now)
-                 + 0.4 * (o.name in (b.k.get('friends') or [])) - 0.04 * abs(o.level - b.level) - 0.5 * (o.company != b.company))
+        score = 0.5 * same_map + 0.3 * same_job + 0.4 * friend + d + _appeal(b, o.value()['power']) + b.memory.relation(o.name, now)
         cands.append((score, o.uid, o.name, o))
     if not cands:
         return
@@ -394,11 +458,13 @@ def party(y, b, now):
 
 
 def decide_group(y, b, name, uid, now):
-    """Does it accept the group invitation. Grouping is the norm (shared rewards and quest kills): most pilots accept, a clanmate almost
-    always; a stronger, higher-ranked inviter is sought after, a much weaker one is carried less gladly; another company only on 4-X / 5-X
-    and rarely; a lone wolf, fatigue or a job it would not drop (gate, mode, duel) lower it. Already in a bot-only party: a player's
-    invitation can still win (invites leaves the party). If it said "inv me" in chat (promise) it accepts. Before, about half accepted,
-    a clanmate had no bonus and every level of gap counted against the inviter, so the strongest player was refused most."""
+    """Does it accept the group invitation. Grouping is the norm (shared rewards and quest kills): most pilots accept. What counts: the
+    inviter's power (a stronger one speeds progress, a much weaker one slows it, less so for a helpful pilot: standing), diplomacy
+    (same clan > allied clan > same company; another company on 4-5 / 5-X if the pilot is open to it, almost never on 4-1..4-4 unless
+    the clans are allied, rare elsewhere; clans at war: no), friendship and memory; a lone wolf, fatigue or a job it would not drop
+    (gate, mode, duel) lower it. Already in a bot-only party: a player's invitation can still win (invites leaves the party). If it said
+    "inv me" in chat (promise) it accepts. Before, about half accepted, a clanmate had no bonus and every level of gap counted against
+    the inviter, so the strongest player was refused most (5% for a level 25 player)."""
     from . import interaction as IX
     if IX.has_promise(b, 'group', name, now):
         return True
@@ -413,17 +479,14 @@ def decide_group(y, b, name, uid, now):
     elif b.target is not None and b.target.name == 'quest':
         p -= 0.05                                        # quest kills are shared in a group: hardly a reason to refuse
     if o is not None and o.profile is not None:
-        lv, rk = _standing(o)
-        p += min(0.15, 0.02 * max(0, lv - b.level) + 0.01 * max(0, rk - rank(b)))
-        p -= 0.03 * max(0, b.level - lv - 5)
-        if b.k.get('clan') is not None and _clan_id(o) == b.k.get('clan'):
-            p += 0.3
-        if int(o.profile.d['pilot'].get('factionId', 0) or 0) != b.company:
-            p -= 0.5 if _war_map(_map_of(o)) else 0.8     # not the norm on 4-X / 5-X, rare elsewhere
+        p += _standing(b, _power_of(y, o))
+        p += _diplo(b, int(o.profile.d['pilot'].get('factionId', 0) or 0), _clan_id(o), _map_of(o))
+        if name in (b.k.get('friends') or []):
+            p += 0.1
     g = GR.group_of(b.uid)
     if g is not None and _human(uid) and not any(_human(u) for u in g.members):
         p -= 0.15                                        # leaves its bot party for him: a little less likely
-    return b.r.random() < max(0.03, min(0.98, p))
+    return b.r.random() < max(0.01, min(0.98, p))
 
 
 def friendship(y, b, now):
